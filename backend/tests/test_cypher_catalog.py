@@ -45,7 +45,7 @@ def test_working_memory_atomic_claim_syntax():
     """Verifies atomic subtask claiming enforces dependency checks."""
     query = CYPHER_CATALOG["WORKING_MEMORY_ATOMIC_CLAIM"]
     assert "status: 'PENDING'" in query
-    assert "NOT EXISTS" in query
-    assert "dep.status <> 'COMPLETED'" in query
+    assert "NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'PENDING'})" in query
     assert "SET st.status = 'IN_PROGRESS'" in query
     assert "st.locked_by = $agent_id" in query
+

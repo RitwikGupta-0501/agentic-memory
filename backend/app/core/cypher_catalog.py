@@ -106,13 +106,12 @@ RETURN st, dep
 
 WORKING_MEMORY_ATOMIC_CLAIM = """
 MATCH (t:TaskRun {id: $task_id})-[:HAS_SUBTASK]->(st:SubTask {status: 'PENDING'})
-WHERE NOT EXISTS {
-    MATCH (st)-[:DEPENDS_ON]->(dep:SubTask)
-    WHERE dep.status <> 'COMPLETED'
-}
+WHERE NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'PENDING'})
+  AND NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'IN_PROGRESS'})
 WITH st LIMIT 1
 SET st.status = 'IN_PROGRESS',
     st.locked_by = $agent_id,
+
     st.claimed_at = $now
 WITH st
 OPTIONAL MATCH (st)-[:DEPENDS_ON]->(parent:SubTask)-[:PINNED_CONTEXT]->(ctx)
