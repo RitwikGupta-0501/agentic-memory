@@ -12,6 +12,7 @@ from app.core.cypher_catalog import (
     WORKING_MEMORY_ATOMIC_CLAIM,
     WORKING_MEMORY_COMPLETE_SUBTASK,
     WORKING_MEMORY_PIN_CONTEXT,
+    MEMORY_UTILITY_FEEDBACK_UPDATE,
 )
 from app.core.falkor_client import falkor_router
 
@@ -121,8 +122,10 @@ class WorkingMemoryManager:
         agent_id: str,
         result_summary: str,
         user_id: Optional[str] = None,
+        reward: Optional[float] = None,
+        alpha: float = 0.2,
     ) -> bool:
-        """Marks a subtask as COMPLETED."""
+        """Marks a subtask as COMPLETED and optionally updates utility of pinned context."""
         now = time.time()
         res = self.router.query(
             WORKING_MEMORY_COMPLETE_SUBTASK,
@@ -135,6 +138,18 @@ class WorkingMemoryManager:
             tenant_id=tenant_id,
             user_id=user_id,
         )
+        if reward is not None:
+            self.router.query(
+                MEMORY_UTILITY_FEEDBACK_UPDATE,
+                {
+                    "subtask_id": subtask_id,
+                    "reward": float(reward),
+                    "alpha": float(alpha),
+                    "now": now,
+                },
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
         return bool(res and res.result_set)
 
     def pin_context(

@@ -11,12 +11,14 @@ from app.core.cypher_catalog import (
     ATOMIC_EPISODE_APPEND,
     EPISODE_INSERT_AND_CHAIN,
     EPISODE_INSERT_ROOT,
+    EPISODE_UTILITY_FEEDBACK_UPDATE,
     EPISODE_VECTOR_SEARCH_CANDIDATES,
     MULTI_SESSION_LINEAGE_QUERY,
     SESSION_ENSURE_AND_LINK,
 )
 from app.core.embeddings.factory import embedding_service
 from app.core.falkor_client import falkor_router
+from app.memory.importance import ImportanceScorer, importance_scorer
 
 
 class EpisodeRecord(BaseModel):
@@ -47,9 +49,15 @@ class EpisodeRecord(BaseModel):
 class EpisodicMemoryManager:
     """Manages ingestion and chronological retrieval of vector-indexed episodic memory nodes."""
 
-    def __init__(self, router=falkor_router, embeddings=embedding_service):
+    def __init__(
+        self,
+        router=falkor_router,
+        embeddings=embedding_service,
+        scorer: Optional[ImportanceScorer] = None,
+    ):
         self.router = router
         self.embeddings = embeddings
+        self.scorer = scorer or importance_scorer
 
     def record_episode(
         self,
@@ -60,7 +68,7 @@ class EpisodicMemoryManager:
         actor_id: str = "user",
         status: str = "SUCCESS",
         structured_payload: Optional[Dict[str, Any]] = None,
-        importance_score: float = 0.5,
+        importance_score: Optional[float] = None,
         utility_score: Optional[float] = None,
         vcache_threshold: float = 0.78,
         token_count: Optional[int] = None,
@@ -87,9 +95,21 @@ class EpisodicMemoryManager:
 
         active_model = self.embeddings.provider.model_name
         active_dim = self.embeddings.provider.dimension
-        final_utility = utility_score if utility_score is not None else importance_score
 
-        # 3. Validate against EpisodeRecord schema
+        # 3. Dynamic importance scoring if not explicitly supplied
+        if importance_score is None:
+            computed_importance = self.scorer.score(
+                content=content,
+                role=role,
+                status=status,
+                structured_payload=structured_payload,
+            )
+        else:
+            computed_importance = importance_score
+
+        final_utility = utility_score if utility_score is not None else computed_importance
+
+        # 4. Validate against EpisodeRecord schema
         record = EpisodeRecord(
             id=ep_id,
             session_id=session_id,
@@ -100,7 +120,7 @@ class EpisodicMemoryManager:
             content=content,
             structured_payload=structured_payload,
             status=status,
-            importance_score=importance_score,
+            importance_score=computed_importance,
             utility_score=final_utility,
             vcache_threshold=vcache_threshold,
             access_count=0,
@@ -300,6 +320,40 @@ class EpisodicMemoryManager:
                     "tail_summary": row[5],
                 })
         return lineage
+
+    def update_episode_feedback(
+        self,
+        tenant_id: str,
+        episode_id: str,
+        reward: float,
+        alpha: float = 0.2,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Updates an episode's utility score (MemRL) and decision threshold (vCache) post-execution."""
+        t_id = tenant_id or settings.default_tenant_id
+        now = time.time()
+        params = {
+            "episode_id": episode_id,
+            "reward": float(reward),
+            "alpha": float(alpha),
+            "now": now,
+        }
+        res = self.router.query(
+            EPISODE_UTILITY_FEEDBACK_UPDATE,
+            params,
+            tenant_id=t_id,
+            user_id=user_id,
+        )
+        if res and res.result_set and res.result_set[0]:
+            row = res.result_set[0]
+            return {
+                "status": "SUCCESS",
+                "episode_id": row[0],
+                "new_utility": row[1],
+                "new_threshold": row[2],
+                "access_count": row[3],
+            }
+        return {"status": "NOT_FOUND", "episode_id": episode_id}
 
 
 episodic_memory = EpisodicMemoryManager()
