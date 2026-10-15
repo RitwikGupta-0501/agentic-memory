@@ -14,28 +14,79 @@ from typing import Dict, Any
 EPISODE_INSERT_AND_CHAIN = """
 MATCH (last_ep:Episode {session_id: $session_id})
 WHERE NOT (last_ep)-[:NEXT_EPISODE]->()
-MERGE (new_ep:Episode {
-    id: $episode_id,
-    session_id: $session_id,
-    content: $content,
-    role: $role,
-    importance_score: $importance_score,
-    timestamp: $timestamp
-})
+MERGE (new_ep:Episode {id: $episode_id})
+ON CREATE SET
+    new_ep.session_id = $session_id,
+    new_ep.tenant_id = $tenant_id,
+    new_ep.content = $content,
+    new_ep.role = $role,
+    new_ep.actor_id = $actor_id,
+    new_ep.status = $status,
+    new_ep.structured_payload = $structured_payload,
+    new_ep.importance_score = $importance_score,
+    new_ep.utility_score = $utility_score,
+    new_ep.vcache_threshold = $vcache_threshold,
+    new_ep.access_count = $access_count,
+    new_ep.last_accessed = $last_accessed,
+    new_ep.timestamp = $timestamp,
+    new_ep.token_count = $token_count,
+    new_ep.embedding_model = $embedding_model,
+    new_ep.embedding_dim = $embedding_dim,
+    new_ep.embedding = vecf32($embedding),
+    new_ep.archived = false
 CREATE (last_ep)-[:NEXT_EPISODE {latency_ms: $latency_ms}]->(new_ep)
 RETURN new_ep
 """
 
 EPISODE_INSERT_ROOT = """
-MERGE (new_ep:Episode {
-    id: $episode_id,
-    session_id: $session_id,
-    content: $content,
-    role: $role,
-    importance_score: $importance_score,
-    timestamp: $timestamp
-})
+MERGE (new_ep:Episode {id: $episode_id})
+ON CREATE SET
+    new_ep.session_id = $session_id,
+    new_ep.tenant_id = $tenant_id,
+    new_ep.content = $content,
+    new_ep.role = $role,
+    new_ep.actor_id = $actor_id,
+    new_ep.status = $status,
+    new_ep.structured_payload = $structured_payload,
+    new_ep.importance_score = $importance_score,
+    new_ep.utility_score = $utility_score,
+    new_ep.vcache_threshold = $vcache_threshold,
+    new_ep.access_count = $access_count,
+    new_ep.last_accessed = $last_accessed,
+    new_ep.timestamp = $timestamp,
+    new_ep.token_count = $token_count,
+    new_ep.embedding_model = $embedding_model,
+    new_ep.embedding_dim = $embedding_dim,
+    new_ep.embedding = vecf32($embedding),
+    new_ep.archived = false
 RETURN new_ep
+"""
+
+EPISODE_VECTOR_SEARCH_CANDIDATES = """
+CALL db.idx.vector.queryNodes('Episode', 'embedding', $candidate_limit, vecf32($query_vec))
+YIELD node AS ep, score AS distance
+WITH ep, (1.0 - distance) AS similarity_score
+WHERE (ep.session_id = $session_id OR $cross_session = true)
+  AND (ep.embedding_model = $current_model OR $current_model IS NULL)
+  AND similarity_score >= coalesce(ep.vcache_threshold, 0.50)
+RETURN ep, similarity_score
+ORDER BY similarity_score DESC
+"""
+
+GRAPH_METADATA_GET = """
+MATCH (m:GraphMetadata)
+RETURN m.active_embedding_model AS active_model,
+       m.active_dimension AS active_dimension,
+       m.last_reindexed_at AS last_reindexed_at
+LIMIT 1
+"""
+
+GRAPH_METADATA_UPSERT = """
+MERGE (m:GraphMetadata {tenant_id: $tenant_id})
+SET m.active_embedding_model = $model,
+    m.active_dimension = $dim,
+    m.updated_at = $now
+RETURN m
 """
 
 # ==========================================
@@ -265,4 +316,7 @@ CYPHER_CATALOG: Dict[str, str] = {
     "CONSOLIDATION_INSIGHT_CREATE": CONSOLIDATION_INSIGHT_CREATE,
     "VISUALIZE_ALL_GRAPH": VISUALIZE_ALL_GRAPH,
     "VISUALIZE_ACTIVE_GRAPH": VISUALIZE_ACTIVE_GRAPH,
+    "EPISODE_VECTOR_SEARCH_CANDIDATES": EPISODE_VECTOR_SEARCH_CANDIDATES,
+    "GRAPH_METADATA_GET": GRAPH_METADATA_GET,
+    "GRAPH_METADATA_UPSERT": GRAPH_METADATA_UPSERT,
 }
