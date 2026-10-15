@@ -76,9 +76,10 @@ class EpisodicMemoryManager:
         user_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
         episode_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Atomically appends an episode to the session tail pointer and maintains linear timeline."""
-        now = time.time()
+        now = float(timestamp) if timestamp is not None else time.time()
         start_t = time.perf_counter()
 
         ep_id = episode_id or f"ep_{uuid.uuid4().hex[:10]}"
