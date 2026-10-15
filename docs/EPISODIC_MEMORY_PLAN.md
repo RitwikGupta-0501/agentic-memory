@@ -259,12 +259,14 @@ This allows agents in Session 10 to easily traverse cross-session boundaries wit
 
 ---
 
-### Phase 3: Embedding Pipeline & Dynamic Importance Scoring Engine
+### Phase 3: Embedding Pipeline & Dynamic Importance Scoring Engine `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Delivered via `feat/dynamic-importance-and-feedback` — 39/39 Unit & Integration Tests Passing, MemRL Q-Value $[0.05, 1.00]$ Clamped, vCache Decision Boundaries, Dual-Stage Importance Scorer with Word-Boundary Safeguards, and Live FalkorDB Feedback Hooks)
 
 #### Objective
-Replace hardcoded importance scores (`0.5`/`0.8`) and missing embeddings with a dual-stage cognitive scoring pipeline: high-throughput vector embedding generation and adaptive LLM/heuristic importance calibration.
+Replace hardcoded importance scores (`0.5`/`0.8`) and static thresholds with a dual-stage cognitive scoring pipeline: high-throughput vector embedding generation and adaptive LLM/heuristic importance calibration, coupled with post-creation runtime reinforcement learning via MemRL and vCache.
 
-#### Architecture of the Scoring Pipeline
+#### Architecture of the Scoring & Feedback Pipeline
 
 ```mermaid
 flowchart TD
@@ -310,8 +312,18 @@ Create `backend/app/core/embeddings.py` supporting:
 
 2. **R3.2 - Calibrated Dynamic Importance**:
    - *Current:* Fixed constant `0.5`.
-   - *Target:* Dynamic score where critical errors (`ERR_NO_WAL_CHECKPOINT`) score $\ge 0.85$ and greetings score $\le 0.25$.
-   - *Acceptance:* Unit test asserting that simulated error logs receive `importance >= 0.85` without manual developer override.
+   - *Target:* Dynamic score where critical errors (`ERR_NO_WAL_CHECKPOINT`) score $\ge 0.85$ and greetings score $\le 0.25$ with regex word-boundary anchors.
+   - *Acceptance:* Unit tests in `test_importance_scoring.py` asserting that error logs receive `importance >= 0.85` and substrings in words like `token`, `rollback`, `architecture` do not falsely match greetings.
+
+3. **R3.3 - MemRL Online Utility Adaptation with Case Clamp**:
+   - *Current:* Static importance scores post-creation.
+   - *Target:* Runtime reward feedback $r \in \{+1.0, -1.0\}$ updates $Q(m) = Q(m) + \alpha(r - Q(m))$ strictly clamped inside $[0.05, 1.00]$.
+   - *Acceptance:* Unit test verifying $Q$ shifts dynamically on success/failure and never drops below $0.05$ or exceeds $1.00$.
+
+4. **R3.4 - vCache Node Decision Boundary Tightening**:
+   - *Current:* Static vector search threshold across all nodes.
+   - *Target:* Dynamic per-node acceptance threshold $t_i \in [0.50, 0.98]$ adapting post-creation based on verification outcomes ($r > 0 \implies -0.02$, $r \le 0 \implies +0.05$).
+   - *Acceptance:* Unit test verifying threshold relaxes on positive outcomes and tightens on negative outcomes.
 
 ---
 
