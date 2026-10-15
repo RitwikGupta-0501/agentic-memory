@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
 from app.core.embeddings.base import BaseEmbeddingProvider
@@ -77,6 +77,16 @@ class CachedEmbeddingService:
     @property
     def model_name(self) -> str:
         return self._provider.model_name
+
+    def get_info(self) -> Dict[str, Any]:
+        """Returns metadata about the active provider and cache status."""
+        return {
+            "provider_type": self._provider.__class__.__name__,
+            "model_name": self.model_name,
+            "dimension": self.dimension,
+            "cache_size": len(self._cache),
+            "max_cache_size": self._max_cache,
+        }
 
     def set_provider(self, provider: BaseEmbeddingProvider) -> None:
         """Dynamically reassigns the underlying provider and clears the cache."""
