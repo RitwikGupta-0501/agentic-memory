@@ -96,6 +96,52 @@ RETURN anc.id AS session_id,
        tail.content AS tail_summary
 """
 
+EPISODE_UTILITY_FEEDBACK_UPDATE = """
+MATCH (ep:Episode {id: $episode_id})
+WITH ep, coalesce(ep.utility_score, ep.importance_score, 0.5) AS old_u,
+     coalesce(ep.vcache_threshold, 0.78) AS old_tau
+WITH ep, old_tau,
+     round((old_u + $alpha * ($reward - old_u)) * 1000.0) / 1000.0 AS raw_u
+SET ep.access_count = coalesce(ep.access_count, 0) + 1,
+    ep.last_accessed = $now,
+    ep.utility_score = CASE
+        WHEN raw_u < 0.05 THEN 0.05
+        WHEN raw_u > 1.00 THEN 1.00
+        ELSE raw_u
+    END,
+    ep.vcache_threshold = CASE
+        WHEN $reward > 0 THEN CASE WHEN old_tau - 0.02 < 0.50 THEN 0.50 ELSE round((old_tau - 0.02) * 100.0) / 100.0 END
+        ELSE CASE WHEN old_tau + 0.05 > 0.98 THEN 0.98 ELSE round((old_tau + 0.05) * 100.0) / 100.0 END
+    END
+RETURN ep.id AS episode_id,
+       ep.utility_score AS new_utility,
+       ep.vcache_threshold AS new_threshold,
+       ep.access_count AS access_count
+"""
+
+MEMORY_UTILITY_FEEDBACK_UPDATE = """
+MATCH (st:SubTask {id: $subtask_id})-[:PINNED_CONTEXT]->(m)
+WITH m, coalesce(m.utility_score, m.importance_score, 0.5) AS old_u,
+     coalesce(m.vcache_threshold, 0.78) AS old_tau
+WITH m, old_tau,
+     round((old_u + $alpha * ($reward - old_u)) * 1000.0) / 1000.0 AS raw_u
+SET m.access_count = coalesce(m.access_count, 0) + 1,
+    m.last_accessed = $now,
+    m.utility_score = CASE
+        WHEN raw_u < 0.05 THEN 0.05
+        WHEN raw_u > 1.00 THEN 1.00
+        ELSE raw_u
+    END,
+    m.vcache_threshold = CASE
+        WHEN $reward > 0 THEN CASE WHEN old_tau - 0.02 < 0.50 THEN 0.50 ELSE round((old_tau - 0.02) * 100.0) / 100.0 END
+        ELSE CASE WHEN old_tau + 0.05 > 0.98 THEN 0.98 ELSE round((old_tau + 0.05) * 100.0) / 100.0 END
+    END
+RETURN coalesce(m.id, m.name) AS id,
+       m.utility_score AS new_utility,
+       m.vcache_threshold AS new_threshold,
+       m.access_count AS access_count
+"""
+
 EPISODE_INSERT_AND_CHAIN = """
 MATCH (last_ep:Episode {session_id: $session_id})
 WHERE NOT (last_ep)-[:NEXT_EPISODE]->()
@@ -407,4 +453,6 @@ CYPHER_CATALOG: Dict[str, str] = {
     "SESSION_ENSURE_AND_LINK": SESSION_ENSURE_AND_LINK,
     "ATOMIC_EPISODE_APPEND": ATOMIC_EPISODE_APPEND,
     "MULTI_SESSION_LINEAGE_QUERY": MULTI_SESSION_LINEAGE_QUERY,
+    "EPISODE_UTILITY_FEEDBACK_UPDATE": EPISODE_UTILITY_FEEDBACK_UPDATE,
+    "MEMORY_UTILITY_FEEDBACK_UPDATE": MEMORY_UTILITY_FEEDBACK_UPDATE,
 }
