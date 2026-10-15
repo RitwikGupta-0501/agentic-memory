@@ -33,7 +33,6 @@ class MultiAgentCoordinationEngine:
             session_id=session_id,
             content=user_prompt,
             role="user",
-            importance_score=0.8,
             user_id=user_id,
         )
 
@@ -124,6 +123,7 @@ class MultiAgentCoordinationEngine:
             agent_id="Context & Triage Agent",
             result_summary="Target database validated. Pinned context reference to episode.",
             user_id=user_id,
+            reward=1.0,
         )
 
         yield {
@@ -211,6 +211,7 @@ class MultiAgentCoordinationEngine:
             agent_id="Execution & Reflexion Agent",
             result_summary=res.get("message", "Migration complete."),
             user_id=user_id,
+            reward=1.0 if res.get("status") == "SUCCESS" else -1.0,
         )
 
         yield {

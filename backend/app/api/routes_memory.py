@@ -9,6 +9,7 @@ from app.core.embeddings import embedding_service
 from app.core.embeddings.reindexer import reindex_tenant_embeddings
 from app.core.falkor_client import falkor_router
 from app.memory.episodic import episodic_memory
+from app.memory.importance import importance_scorer
 from app.memory.semantic import semantic_memory, EntityTriple
 
 router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
@@ -37,7 +38,7 @@ class EpisodeCreateRequest(BaseModel):
     actor_id: str = "user"
     status: str = "SUCCESS"
     structured_payload: Optional[Dict[str, Any]] = None
-    importance_score: float = 0.5
+    importance_score: Optional[float] = None
     utility_score: Optional[float] = None
     vcache_threshold: float = 0.78
     token_count: Optional[int] = None
@@ -58,6 +59,21 @@ class ReindexRequest(BaseModel):
     tenant_id: Optional[str] = None
     user_id: Optional[str] = None
     batch_size: int = 50
+
+
+class EpisodeFeedbackRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    episode_id: str
+    reward: float
+    alpha: float = 0.2
+    user_id: Optional[str] = None
+
+
+class ImportanceEvaluateRequest(BaseModel):
+    content: str
+    role: str = "user"
+    status: str = "SUCCESS"
+    structured_payload: Optional[Dict[str, Any]] = None
 
 
 @router.get("/graph")
@@ -284,4 +300,29 @@ def search_episodes(req: EpisodeSearchRequest) -> Dict[str, Any]:
         "results_count": len(results),
         "episodes": results,
     }
+
+
+@router.post("/episode/feedback")
+def update_episode_feedback_endpoint(req: EpisodeFeedbackRequest) -> Dict[str, Any]:
+    """Updates an episode's utility score (MemRL) and decision threshold (vCache) post-execution."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    return episodic_memory.update_episode_feedback(
+        tenant_id=t_id,
+        episode_id=req.episode_id,
+        reward=req.reward,
+        alpha=req.alpha,
+        user_id=req.user_id,
+    )
+
+
+@router.post("/importance/evaluate")
+def evaluate_importance_endpoint(req: ImportanceEvaluateRequest) -> Dict[str, Any]:
+    """Evaluates cognitive importance score using Stage 1 heuristics and Stage 2 LLM/entropy reflection."""
+    return importance_scorer.evaluate(
+        content=req.content,
+        role=req.role,
+        status=req.status,
+        structured_payload=req.structured_payload,
+    )
+
 

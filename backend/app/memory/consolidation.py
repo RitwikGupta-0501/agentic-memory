@@ -39,9 +39,11 @@ class ConsolidationEngine:
                 node = row[0]
                 degree = row[1]
                 props = getattr(node, "properties", {})
-                last_t = props.get("timestamp", now)
+                last_t = props.get("last_accessed", props.get("timestamp", now))
                 delta_t = max(0.0, now - last_t)
-                retention = degree * math.exp(-decay_lambda * delta_t)
+                utility = float(props.get("utility_score", props.get("importance_score", 0.5)))
+                access_strength = int(props.get("access_count", 0)) + 1
+                retention = (degree + 1) * utility * math.exp(-(decay_lambda * delta_t) / access_strength)
 
                 scores.append({
                     "id": props.get("id", props.get("name", "unknown")),
