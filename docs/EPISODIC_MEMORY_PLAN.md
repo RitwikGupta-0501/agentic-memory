@@ -120,10 +120,17 @@ To transform the episodic layer from a fragile mock into a battle-tested product
 
 ---
 
-### Phase 1: Episodic Schema, Extended Metadata & Vector Indexing
+### Phase 1: Episodic Schema, Extended Metadata & Vector Indexing `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Merged into `main` via PRs [#2](https://github.com/RitwikGupta-0501/agentic-memory/pull/2), [#3](https://github.com/RitwikGupta-0501/agentic-memory/pull/3), [#4](https://github.com/RitwikGupta-0501/agentic-memory/pull/4) — 28/28 Unit & Integration Tests Passing)
 
 #### Objective
 Replace the toy `EpisodeRecord` schema with an immutable, production-grade schema capturing rich execution metadata, token costs, actor hierarchies, and native FalkorDB vector indexes.
+
+#### Delivered Pull Requests
+1. **PR 1 (`feat/generic-embedding-engine` -> PR #2):** Generic Pluggable Embedding Infrastructure & Model Drift Engine (`BaseEmbeddingProvider`, Gemini, OpenAI, Ollama, DeterministicMock, `CachedEmbeddingService`, self-healing re-indexer).
+2. **PR 2 (`feat/falkor-vector-indexing` -> PR #3):** FalkorDB Dynamic Vector Indexing & Provenance Metadata (`(:GraphMetadata)` singleton, dynamic `vecf32` indexing on `(:Episode)`, `check_graph_embedding_drift`).
+3. **PR 3 (`feat/hardened-episodic-schema` -> PR #4):** Pydantic v2 18-property `EpisodeRecord`, auto-vectorization, token estimation, JSON payload serialization, and REST management endpoints (`POST /episode`, `GET /episodes`, `POST /episodes/search`, `GET /embedding-status`, `POST /reindex`).
 
 #### Component Architecture & Data Model
 Every episode node in FalkorDB will conform to the following verified property specification:
