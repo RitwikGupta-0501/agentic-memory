@@ -76,6 +76,22 @@ class ImportanceEvaluateRequest(BaseModel):
     structured_payload: Optional[Dict[str, Any]] = None
 
 
+class EpisodeRetrieveRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    query: str
+    session_id: Optional[str] = None
+    top_k: int = 5
+    candidate_limit: int = 25
+    cross_session: bool = False
+    alpha: float = 1.0
+    beta: float = 1.0
+    gamma: float = 1.0
+    decay_lambda: float = 0.0001925
+    strict_vcache: bool = False
+    touch_recall: bool = True
+    user_id: Optional[str] = None
+
+
 @router.get("/graph")
 def get_graph_data(
     tenant_id: str = Query(default=settings.default_tenant_id),
@@ -324,5 +340,34 @@ def evaluate_importance_endpoint(req: ImportanceEvaluateRequest) -> Dict[str, An
         status=req.status,
         structured_payload=req.structured_payload,
     )
+
+
+@router.post("/episodes/retrieve")
+def retrieve_episodes_endpoint(req: EpisodeRetrieveRequest) -> Dict[str, Any]:
+    """Retrieves ranked episodic memories using Stanford Generative Agents 3-factor composite scoring."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    results = episodic_memory.retrieve_episodes(
+        tenant_id=t_id,
+        query=req.query,
+        session_id=req.session_id,
+        top_k=req.top_k,
+        candidate_limit=req.candidate_limit,
+        cross_session=req.cross_session,
+        alpha=req.alpha,
+        beta=req.beta,
+        gamma=req.gamma,
+        decay_lambda=req.decay_lambda,
+        strict_vcache=req.strict_vcache,
+        touch_recall=req.touch_recall,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "query": req.query,
+        "top_k": req.top_k,
+        "results_count": len(results),
+        "episodes": results,
+    }
+
 
 

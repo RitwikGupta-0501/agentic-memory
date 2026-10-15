@@ -327,7 +327,9 @@ Create `backend/app/core/embeddings.py` supporting:
 
 ---
 
-### Phase 4: Park et al. 3-Factor Hybrid Retrieval Engine
+### Phase 4: Park et al. 3-Factor Hybrid Retrieval Engine `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Delivered via `feat/park-3factor-retrieval` — 46/46 Unit & Integration Tests Passing, Stanford Generative Agents 3-Factor Composite Ranking, MemoryBank Recency Decay with Recall Reinforcement, MemRL Dynamic Utility Injection, Soft vCache Decision Boundary Gating, Intra-Session Fallback Scan, Single-Query Batch Touch & Inbound Provenance Expansion, and Seed Data Migration)
 
 #### Objective
 Implement the formal Stanford Generative Agents retrieval algorithm natively in OpenCypher and Python, balancing temporal recency decay, importance weighting, and semantic cosine similarity.
@@ -335,24 +337,47 @@ Implement the formal Stanford Generative Agents retrieval algorithm natively in 
 #### Detailed Retrieval Algorithm
 Given tenant $T$, query string $Q$, candidate pool size $K$, and weights $(\alpha, \beta, \gamma)$:
 
-1. **Vector Query Phase with `vCache` Gating (FalkorDB native):**
-   Generate embedding $\mathbf{e}_Q$. Issue OpenCypher vector index query to retrieve candidate pool (e.g., $K = 25$), filtering candidates that fail their individual node threshold:
+1. **Vector Candidate Fetch with Soft `vCache` Gating & Fallback Scan:**
+   Generate embedding $\mathbf{e}_Q$. Issue OpenCypher vector index query to retrieve candidate pool (e.g., $K = 25$):
    ```cypher
    CALL db.idx.vector.queryNodes('Episode', 'embedding', $candidate_limit, vecf32($query_vec))
-   YIELD node AS ep, score AS relevance_score
-   WHERE (ep.session_id = $session_id OR $cross_session = true)
-     AND relevance_score >= coalesce(ep.vcache_threshold, 0.75)
-   RETURN ep, relevance_score
+   YIELD node AS ep, score AS raw_score
+   WHERE coalesce(ep.archived, false) = false
+     AND ($cross_session = true OR ep.session_id = $session_id)
+   RETURN ep, raw_score
    ```
+   If vector ANN returns 0 candidates (e.g. intra-session sparsity), fall back to `EPISODE_FALLBACK_SCAN_FETCH` ordered by timestamp.
+   Normalize raw distance to cosine similarity: $\text{Relevance} = \max(0.0, \min(1.0, 1.0 - \text{raw\_score}))$.
+   Apply per-node `vCache` threshold $\hat{\tau}_i$: if $\text{Relevance} < \hat{\tau}_i$, apply soft $0.5\times$ penalty (or prune if `strict_vcache=True`).
+
 2. **Temporal Decay & MemoryBank Strength Phase:**
-   For each candidate episode, calculate elapsed time $\Delta t = t_{\text{now}} - ep.\text{timestamp}$.
+   Calculate elapsed time $\Delta t = \max(0.0, t_{\text{now}} - coalesce(ep.\text{last\_accessed}, ep.\text{timestamp}))$.
    Compute decay factor with `MemoryBank` recall reinforcement:
-   $$\text{Recency} = \exp\left(-\frac{\lambda \cdot \Delta t}{coalesce(ep.\text{access\_count}, 0) + 1}\right)$$
+   $$S_{\text{rec}} = \exp\left(-\frac{\lambda \cdot \Delta t}{coalesce(ep.\text{access\_count}, 0) + 1}\right)$$
+
 3. **Composite Scoring Phase (with `MemRL` Utility):**
-   Use dynamic `utility_score` (falling back to `importance_score`):
-   $$\text{FinalScore} = \frac{\alpha \cdot \text{Recency} + \beta \cdot coalesce(ep.\text{utility\_score}, ep.\text{importance\_score}, 0.5) + \gamma \cdot \text{relevance\_score}}{\alpha + \beta + \gamma}$$
-4. **Top-$N$ Selection, Provenance Expansion & Recall Touch:**
-   Sort candidates by $\text{FinalScore}$ descending. For retrieved episodes, increment `ep.access_count += 1` and set `ep.last_accessed = $now` (`MemoryBank` pattern). Expand 1 hop to collect pinned subtasks or derived semantic entities.
+   Prioritize online-learned utility: $S_{\text{imp}} = coalesce(ep.\text{utility\_score}, ep.\text{importance\_score}, 0.5) \in [0.05, 1.00]$.
+   $$\text{FinalScore} = \frac{\alpha \cdot S_{\text{rec}} + \beta \cdot S_{\text{imp}} + \gamma \cdot S_{\text{rel\_eff}}}{\alpha + \beta + \gamma}$$
+
+4. **Atomic Batch Recall Touch & Inbound Provenance Expansion:**
+   Sort candidates by $\text{FinalScore}$ descending and slice top $K$.
+   In a single atomic round-trip, update `access_count += 1`, `last_accessed = now`, and collect inbound provenance links:
+   ```cypher
+   UNWIND $episode_ids AS ep_id
+   MATCH (ep:Episode {id: ep_id})
+   SET ep.access_count = coalesce(ep.access_count, 0) + CASE WHEN $touch = true THEN 1 ELSE 0 END,
+       ep.last_accessed = CASE WHEN $touch = true THEN $now ELSE coalesce(ep.last_accessed, ep.timestamp) END
+   WITH ep
+   OPTIONAL MATCH (ctx)-[r:DERIVED_FROM|PINNED_CONTEXT|TRIGGERED_BY|CONSOLIDATES]->(ep)
+   RETURN ep.id AS episode_id,
+          ep.access_count AS access_count,
+          ep.last_accessed AS last_accessed,
+          collect(DISTINCT {
+              label: labels(ctx)[0],
+              id: coalesce(ctx.id, ctx.name),
+              rel_type: type(r)
+          }) AS provenance_links
+   ```
 
 ```mermaid
 sequenceDiagram
@@ -363,30 +388,41 @@ sequenceDiagram
 
     Agent->>Manager: retrieve_episodes(query="database cutover issue", top_k=5)
     Manager->>Manager: Embed query -> 768-dim vector
-    Manager->>Falkor: CALL db.idx.vector.queryNodes('Episode', candidate_limit=25)
-    Falkor-->>Manager: 25 Candidate (:Episode) nodes + Cosine Similarities
+    Manager->>Falkor: EPISODE_HYBRID_CANDIDATE_FETCH (candidate_limit=25)
+    Falkor-->>Manager: 25 Candidate (:Episode) nodes + raw distances
     loop For Each Candidate
-        Manager->>Manager: Calculate Recency: exp(-lambda * delta_t)
-        Manager->>Manager: Extract stored importance_score
-        Manager->>Manager: Compute Composite = α*Recency + β*Importance + γ*Cosine
+        Manager->>Manager: Calculate Recency: exp(-lambda * delta_t / (access_count + 1))
+        Manager->>Manager: Extract MemRL utility_score
+        Manager->>Manager: Compute Cosine Similarity & apply soft vCache gating
+        Manager->>Manager: Compute Composite = (α*Recency + β*Utility + γ*Relevance) / (α+β+γ)
     end
     Manager->>Manager: Sort candidates descending & slice top 5
-    Manager->>Falkor: OPTIONAL MATCH (ep)-[:MENTIONS|PINNED_CONTEXT]->(ctx)
-    Falkor-->>Manager: Graph context & provenance nodes
-    Manager-->>Agent: Ranked, fully contextualized episodic memories
+    Manager->>Falkor: EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND (top_ids, touch=true)
+    Falkor-->>Manager: Updated access counters & inbound provenance links
+    Manager-->>Agent: Ranked ScoredEpisode memories with component breakdown & provenance
 ```
 
 #### Falsifiable Requirements
 
 1. **R4.1 - 3-Factor Composite Ranking**:
    - *Current:* Blind `ORDER BY timestamp LIMIT 50`.
-   - *Target:* Full implementation of `retrieve_episodes()` returning ranked `ScoredEpisode` objects with explicit component score breakdown (`recency_score`, `importance_score`, `relevance_score`, `composite_score`).
-   - *Acceptance:* Test verifying that a highly relevant, high-importance memory from 3 days ago beats an irrelevant memory from 5 minutes ago.
+   - *Target:* Full implementation of `retrieve_episodes()` returning ranked `ScoredEpisode` objects with explicit component score breakdown (`recency_score`, `importance_score`, `utility_score`, `relevance_score`, `composite_score`).
+   - *Acceptance:* Verified via `test_live_r41_recency_vs_importance_tradeoff` in `test_park_3factor_retrieval.py` asserting that a 2-day-old, high-utility, relevant memory outranks an irrelevant greeting from 30 seconds ago.
 
 2. **R4.2 - Cross-Session Retrieval Capability**:
    - *Current:* Ingestion and retrieval restricted to current `session_id`.
    - *Target:* Parameter `cross_session: bool = False` allowing agents to recall historical episodes across all prior sessions within the tenant graph.
-   - *Acceptance:* Successful recall of an episode created in `session_1` while querying from `session_2`.
+   - *Acceptance:* Verified via `test_live_cross_session_vs_intra_session_retrieval` in `test_park_3factor_retrieval.py` demonstrating strict session isolation when `False` and cross-session discovery when `True`.
+
+3. **R4.3 - vCache Decision Boundary Gating**:
+   - *Current:* Flat global similarity threshold.
+   - *Target:* Per-node decision boundary threshold evaluation with soft penalty multiplier.
+   - *Acceptance:* Verified via `test_live_vcache_soft_penalty_vs_strict_gating` in `test_park_3factor_retrieval.py`.
+
+4. **R4.4 - Single-Query Inbound Provenance & Touch**:
+   - *Current:* Missing provenance links; separate queries for mutations.
+   - *Target:* Atomic `EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND` touching `access_count` and linking inbound `[:DERIVED_FROM]`, `[:PINNED_CONTEXT]`, `[:TRIGGERED_BY]`.
+   - *Acceptance:* Verified via `test_live_batch_recall_touch_and_inbound_provenance` in `test_park_3factor_retrieval.py`.
 
 ---
 

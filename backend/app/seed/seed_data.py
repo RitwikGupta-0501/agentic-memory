@@ -3,6 +3,7 @@
 import logging
 import time
 from app.core.falkor_client import falkor_router
+from app.memory.episodic import episodic_memory
 
 logger = logging.getLogger("aegis.seed")
 
@@ -22,36 +23,34 @@ def seed_tenant_acme_payments():
 
     logger.info(f"Seeding tenant '{t_id}'...")
 
-    # 1. Episodic Memory Chained Nodes
-    episodes_query = """
-    CREATE (ep1:Episode {
-        id: 'ep_init_1',
-        session_id: 'session_sre_01',
-        content: 'Alice: Deploying initial payment processing pipeline with PostgreSQL.',
-        role: 'user',
-        importance_score: 0.7,
-        timestamp: $t1
-    })
-    CREATE (ep2:Episode {
-        id: 'ep_init_2',
-        session_id: 'session_sre_01',
-        content: 'System: Initialized Prod_DB with PostgreSQL 16 cluster in us-east-1.',
-        role: 'system',
-        importance_score: 0.6,
-        timestamp: $t1 + 60
-    })
-    CREATE (ep3:Episode {
-        id: 'ep_init_3',
-        session_id: 'session_sre_01',
-        content: 'Alice: Migrating Prod_DB from PostgreSQL to FalkorDB for low-latency cognitive graph memory.',
-        role: 'user',
-        importance_score: 0.9,
-        timestamp: $t2
-    })
-    CREATE (ep1)-[:NEXT_EPISODE {latency_ms: 60000}]->(ep2)
-    CREATE (ep2)-[:NEXT_EPISODE {latency_ms: 300000}]->(ep3)
-    """
-    falkor_router.query(episodes_query, {"t1": t1, "t2": t2}, tenant_id=t_id)
+    # 1. Episodic Memory Chained Nodes (18-property vector ingestion + :Session boundary)
+    episodic_memory.record_episode(
+        tenant_id=t_id,
+        session_id="session_sre_01",
+        episode_id="ep_init_1",
+        content="Alice: Deploying initial payment processing pipeline with PostgreSQL.",
+        role="user",
+        importance_score=0.7,
+        timestamp=t1,
+    )
+    episodic_memory.record_episode(
+        tenant_id=t_id,
+        session_id="session_sre_01",
+        episode_id="ep_init_2",
+        content="System: Initialized Prod_DB with PostgreSQL 16 cluster in us-east-1.",
+        role="system",
+        importance_score=0.6,
+        timestamp=t1 + 60,
+    )
+    episodic_memory.record_episode(
+        tenant_id=t_id,
+        session_id="session_sre_01",
+        episode_id="ep_init_3",
+        content="Alice: Migrating Prod_DB from PostgreSQL to FalkorDB for low-latency cognitive graph memory.",
+        role="user",
+        importance_score=0.9,
+        timestamp=t2,
+    )
 
     # 2. Semantic Memory with Bi-Temporal Invalidation
     semantic_query = """
@@ -162,15 +161,19 @@ def seed_tenant_nebula_cloud():
 
     logger.info(f"Seeding tenant '{t_id}'...")
 
+    # 1. Episodic Memory Turn (18-property vector ingestion + :Session boundary)
+    episodic_memory.record_episode(
+        tenant_id=t_id,
+        session_id="session_cloud_01",
+        episode_id="ep_nebula_1",
+        content="Bob: Initialized Nebula Cloud Kubernetes cluster v1.30.",
+        role="user",
+        importance_score=0.8,
+        timestamp=now,
+    )
+
     query = """
-    CREATE (ep:Episode {
-        id: 'ep_nebula_1',
-        session_id: 'session_cloud_01',
-        content: 'Bob: Initialized Nebula Cloud Kubernetes cluster v1.30.',
-        role: 'user',
-        importance_score: 0.8,
-        timestamp: $now
-    })
+    MATCH (ep:Episode {id: 'ep_nebula_1'})
     CREATE (cluster:Entity {name: 'Nebula_K8s_Cluster', type: 'Compute'})
     CREATE (k8s:Entity {name: 'Kubernetes_v1.30', type: 'Platform'})
     CREATE (cluster)-[:RELATES_TO {
