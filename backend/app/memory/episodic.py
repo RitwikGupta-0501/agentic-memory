@@ -1,6 +1,7 @@
 """Episodic Memory Layer: Chronological autobiographical log with temporal chaining and vector index."""
 
 import json
+import math
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional
@@ -9,6 +10,9 @@ from pydantic import BaseModel, Field
 from app.core.config import settings
 from app.core.cypher_catalog import (
     ATOMIC_EPISODE_APPEND,
+    EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND,
+    EPISODE_FALLBACK_SCAN_FETCH,
+    EPISODE_HYBRID_CANDIDATE_FETCH,
     EPISODE_INSERT_AND_CHAIN,
     EPISODE_INSERT_ROOT,
     EPISODE_UTILITY_FEEDBACK_UPDATE,
@@ -19,6 +23,20 @@ from app.core.cypher_catalog import (
 from app.core.embeddings.factory import embedding_service
 from app.core.falkor_client import falkor_router
 from app.memory.importance import ImportanceScorer, importance_scorer
+
+
+class ScoredEpisode(BaseModel):
+    """Pydantic model representing a candidate episode ranked via Park et al. 3-factor scoring."""
+
+    episode: Dict[str, Any]
+    recency_score: float
+    importance_score: float
+    utility_score: float
+    relevance_score: float
+    vcache_threshold: float
+    vcache_passed: bool
+    composite_score: float
+    provenance_links: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class EpisodeRecord(BaseModel):
@@ -294,6 +312,189 @@ class EpisodicMemoryManager:
             results = [r for r in results if r["similarity_score"] >= min_similarity]
 
         return results
+
+    def retrieve_episodes(
+        self,
+        tenant_id: str,
+        query: str,
+        session_id: Optional[str] = None,
+        top_k: int = 5,
+        candidate_limit: int = 25,
+        cross_session: bool = False,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+        gamma: float = 1.0,
+        decay_lambda: float = 0.0001925,
+        strict_vcache: bool = False,
+        touch_recall: bool = True,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves and ranks episodic memories using Park et al. 3-factor composite ranking.
+
+        Balances:
+        - Factor 1 (Recency): MemoryBank Ebbinghaus exponential decay reinforced by recall frequency.
+        - Factor 2 (Importance/Utility): MemRL clamped Q-value falling back to initial importance score.
+        - Factor 3 (Relevance): Vector cosine similarity with per-node vCache decision boundary gating.
+
+        Performs atomic batch recall-touch and inbound provenance expansion on top-k winners in 1 round trip.
+        """
+        vec = self.embeddings.embed_text(query)
+        t_id = tenant_id or settings.default_tenant_id
+        now = time.time()
+
+        params = {
+            "query_vec": vec,
+            "candidate_limit": candidate_limit,
+            "session_id": session_id or "",
+            "cross_session": cross_session or (session_id is None),
+        }
+
+        res = self.router.query(
+            EPISODE_HYBRID_CANDIDATE_FETCH,
+            params,
+            tenant_id=t_id,
+            user_id=user_id,
+        )
+
+        candidate_rows = []
+        if res and res.result_set:
+            candidate_rows = res.result_set
+
+        # Fallback scan if vector ANN returns 0 candidates (e.g. intra-session sparsity)
+        if not candidate_rows:
+            fallback_res = self.router.query(
+                EPISODE_FALLBACK_SCAN_FETCH,
+                {
+                    "candidate_limit": candidate_limit,
+                    "session_id": session_id or "",
+                    "cross_session": cross_session or (session_id is None),
+                },
+                tenant_id=t_id,
+                user_id=user_id,
+            )
+            if fallback_res and fallback_res.result_set:
+                candidate_rows = fallback_res.result_set
+
+        if not candidate_rows:
+            return []
+
+        weight_sum = (alpha + beta + gamma) if (alpha + beta + gamma) > 0 else 1.0
+        scored_candidates: List[ScoredEpisode] = []
+
+        for row in candidate_rows:
+            ep_node = row[0]
+            raw_score = float(row[1]) if len(row) > 1 and row[1] is not None else 0.5
+            props = getattr(ep_node, "properties", {}) if ep_node else {}
+            if not props:
+                continue
+
+            # 1. Relevance: normalize raw distance to cosine similarity [0.0, 1.0]
+            relevance = max(0.0, min(1.0, 1.0 - raw_score))
+
+            # vCache decision boundary
+            vcache_tau = float(props.get("vcache_threshold", 0.75))
+            vcache_passed = relevance >= vcache_tau
+            if strict_vcache and not vcache_passed:
+                continue
+
+            effective_relevance = relevance if vcache_passed else (relevance * 0.5)
+
+            # 2. Recency: MemoryBank decay with access_count reinforcement
+            access_count = int(props.get("access_count", 0))
+            last_t = float(props.get("last_accessed") or props.get("timestamp", now))
+            delta_t = max(0.0, now - last_t)
+            recency = math.exp(-(decay_lambda * delta_t) / (access_count + 1))
+            recency = max(0.0, min(1.0, recency))
+
+            # 3. Importance / MemRL Utility
+            importance = float(props.get("importance_score", 0.5))
+            utility = float(props.get("utility_score", importance))
+            utility = max(0.05, min(1.0, utility))
+
+            # 4. Composite Score
+            composite = (alpha * recency + beta * utility + gamma * effective_relevance) / weight_sum
+            composite = max(0.0, min(1.0, composite))
+
+            payload = props.get("structured_payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    pass
+
+            ep_dict = {
+                "id": props.get("id"),
+                "session_id": props.get("session_id"),
+                "role": props.get("role"),
+                "actor_id": props.get("actor_id", "user"),
+                "status": props.get("status", "SUCCESS"),
+                "content": props.get("content"),
+                "structured_payload": payload,
+                "timestamp": props.get("timestamp"),
+                "last_accessed": props.get("last_accessed"),
+                "access_count": access_count,
+                "token_count": props.get("token_count", 0),
+            }
+
+            scored = ScoredEpisode(
+                episode=ep_dict,
+                recency_score=round(recency, 4),
+                importance_score=round(importance, 4),
+                utility_score=round(utility, 4),
+                relevance_score=round(relevance, 4),
+                vcache_threshold=round(vcache_tau, 4),
+                vcache_passed=vcache_passed,
+                composite_score=round(composite, 4),
+            )
+            scored_candidates.append(scored)
+
+        # Sort descending by composite_score and slice top_k
+        scored_candidates.sort(key=lambda s: s.composite_score, reverse=True)
+        top_candidates = scored_candidates[:top_k]
+
+        if not top_candidates:
+            return []
+
+        # 5. Atomic Batch Recall Touch & Provenance Expansion
+        top_ids = [s.episode["id"] for s in top_candidates if s.episode.get("id")]
+        if top_ids:
+            touch_params = {
+                "episode_ids": top_ids,
+                "touch": touch_recall,
+                "now": now,
+            }
+            touch_res = self.router.query(
+                EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND,
+                touch_params,
+                tenant_id=t_id,
+                user_id=user_id,
+            )
+            provenance_by_id = {}
+            if touch_res and touch_res.result_set:
+                for trow in touch_res.result_set:
+                    t_ep_id = trow[0]
+                    new_access = trow[1]
+                    new_last = trow[2]
+                    plinks = trow[3] or []
+                    provenance_by_id[t_ep_id] = {
+                        "access_count": new_access,
+                        "last_accessed": new_last,
+                        "provenance_links": [
+                            link for link in plinks if link and link.get("id")
+                        ],
+                    }
+
+            # Attach provenance links & updated access counters to top candidates
+            for cand in top_candidates:
+                cid = cand.episode.get("id")
+                if cid in provenance_by_id:
+                    p_info = provenance_by_id[cid]
+                    cand.provenance_links = p_info["provenance_links"]
+                    if touch_recall:
+                        cand.episode["access_count"] = p_info["access_count"]
+                        cand.episode["last_accessed"] = p_info["last_accessed"]
+
+        return [c.model_dump() for c in top_candidates]
 
     def get_session_lineage(
         self,
