@@ -37,6 +37,9 @@ Every architectural choice in this PRD directly implements mechanisms from peer-
 | **Semantic Memory** | **HippoRAG:** *Neurobiologically Inspired Long-Term Memory for LLMs* (Gutiérrez et al., OSU, 2024 – `arXiv:2405.14831`) | Uses vector search strictly to locate **entry seed nodes**, then executes multi-hop Cypher neighborhood traversal to assemble connected relational context. |
 | **Semantic Conflict Resolution** | **Mem0:** *Building Production-Ready AI Agents with Scalable Long-Term Memory* (Chhikara et al., 2025 – `arXiv:2504.19413`) | Distillation-first pipeline using deterministic state transitions (`ADD`, `SUPERSEDE`, `NOOP`) when incoming episodic triples conflict with existing semantic edges. |
 | **Procedural Memory** | **Voyager** (*Wang et al., 2023 – `arXiv:2305.16291*`) & **Reflexion** (*Shinn et al., 2023 – `arXiv:2303.11366*`) | Stores reusable action workflows as executable DAGs (`:Procedure` $\rightarrow$ `:ActionStep`) and converts episodic execution failures into persistent `:Guardrail` edges. |
+| **Dynamic Thresholding** | **vCache:** *Verified Semantic Prompt Caching* (Schroeder et al., UC Berkeley / Stanford / TU Munich, ICLR 2026 – `arXiv:2502.03771`) | Attaches an online-learned decision boundary $(t_i, \gamma_i)$ to each individual stored node, dynamically shifting its acceptance threshold $\hat{\tau}_i$ after creation via runtime verification. |
+| **Post-Creation Value Calibration** | **MemRL:** *Self-Evolving Agents via Runtime Reinforcement Learning on Memory* (Jan 2026 – `arXiv:2601.03192`) | Applies non-parametric RL directly to memory nodes, updating runtime utility/Q-values $Q(m_i)$ post-execution based on task success ($r=+1$) or failure ($r=-1$). |
+| **Recall Reinforcement** | **MemoryBank:** *Enhancing Large Language Models with Long-Term Memory* (Zhong et al., AAAI 2024 – `arXiv:2305.10250`) | Implements Ebbinghaus forgetting with post-creation recall reinforcement: accessing a node resets its recency and increments its memory strength $S \leftarrow S + 1$. |
 
 ---
 
@@ -178,14 +181,24 @@ RETURN proc, nodes(path) AS ordered_steps, collect(g) AS active_guardrails
 
 * **How It Works in FalkorDB:**
 1. **Interactive "Trigger Consolidation Cycle" Button:** Exposed via `POST /api/v1/memory/consolidate` so judges can trigger it on demand during the demo.
-2. **Graph Centrality & Decay:** Runs a Cypher query computing node degree + recency decay:
+2. **Post-Execution Utility & Threshold Feedback (`vCache` + `MemRL`):** When subtasks complete, memory nodes pinned via `[:PINNED_CONTEXT]` receive reinforcement updates based on whether the action succeeded ($r = +1$) or encountered an error ($r = -1$):
+   ```cypher
+   MATCH (st:SubTask {id: $subtask_id})-[:PINNED_CONTEXT]->(m)
+   SET m.access_count = coalesce(m.access_count, 0) + 1,
+       m.last_accessed = $now,
+       m.utility_score = coalesce(m.utility_score, m.importance_score, 0.5) + $alpha * ($reward - coalesce(m.utility_score, m.importance_score, 0.5)),
+       m.vcache_threshold = CASE
+           WHEN $reward > 0 THEN coalesce(m.vcache_threshold, 0.78) - 0.02
+           ELSE coalesce(m.vcache_threshold, 0.78) + 0.05
+       END
+   RETURN m.id AS id, m.name AS name, m.utility_score AS new_utility, m.vcache_threshold AS new_threshold
+   ```
+3. **Graph Retention Scoring (`MemoryBank` Strength + `MemRL` Utility + Degree):**
+   Combines Ebbinghaus recall reinforcement ($S \leftarrow S + 1$), runtime reinforcement learning utility, and graph degree:
 
-$$\text{RetentionScore} = \text{Degree}(n) \times e^{-\lambda (t_{\text{now}} - t_{\text{last\_accessed}})}$$
+$$\text{RetentionScore}(n) = (\text{Degree}(n) + 1) \times \text{Utility}(n) \times e^{-\frac{\lambda \cdot (t_{\text{now}} - t_{\text{last\_accessed}})}{\text{AccessCount}(n) + 1}}$$
 
-
-3. **Episode Compression:** Identifies clusters of older `:Episode` nodes (> $N$ turns old) sharing the same `:Entity` neighborhood, uses an LLM call to synthesize a `:ConsolidatedInsight` node, rewires provenance edges, and marks raw episodes as `archived: true`.
-
-
+4. **Episode Compression:** Identifies clusters of older `:Episode` nodes (> $N$ turns old) sharing the same `:Entity` neighborhood, uses an LLM call to synthesize a `:ConsolidatedInsight` node, rewires provenance edges, and marks raw episodes as `archived: true`.
 
 ---
 

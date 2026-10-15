@@ -33,6 +33,9 @@ Every architectural mechanism in AegisGraph directly implements principles from 
 | **Semantic Memory** | **HippoRAG:** *Neurobiologically Inspired Long-Term Memory for LLMs* (Gutiérrez et al., OSU, 2024 – `arXiv:2405.14831`) | Uses vector search strictly to locate **entry seed nodes**, then executes multi-hop Cypher neighborhood traversal to assemble connected relational context. |
 | **Semantic Conflict Resolution** | **Mem0:** *Building Production-Ready AI Agents with Scalable Long-Term Memory* (Chhikara et al., 2025 – `arXiv:2504.19413`) | Distillation-first pipeline using deterministic state transitions (`ADD`, `SUPERSEDE`, `NOOP`) when incoming episodic triples conflict with existing semantic edges. |
 | **Procedural Memory** | **Voyager** (*Wang et al., 2023 – `arXiv:2305.16291`*) & **Reflexion** (*Shinn et al., 2023 – `arXiv:2303.11366`*) | Stores reusable action workflows as executable DAGs (`:Procedure` $\rightarrow$ `:ActionStep`) and converts episodic execution failures into persistent `:Guardrail` edges. |
+| **Dynamic Thresholding** | **vCache:** *Verified Semantic Prompt Caching* (Schroeder et al., UC Berkeley / Stanford / TU Munich, ICLR 2026 – `arXiv:2502.03771`) | Adapts per-node decision thresholds $\hat{\tau}_i$ after creation via runtime verification feedback loops, preventing stale or inaccurate memory reuse. |
+| **Post-Creation Value Calibration** | **MemRL:** *Self-Evolving Agents via Runtime Reinforcement Learning on Memory* (Jan 2026 – `arXiv:2601.03192`) | Updates runtime utility/Q-values $Q(m_i)$ of memory nodes post-execution via temporal-difference learning based on task success ($r=+1$) or failure ($r=-1$). |
+| **Recall Reinforcement** | **MemoryBank:** *Enhancing Large Language Models with Long-Term Memory* (Zhong et al., AAAI 2024 – `arXiv:2305.10250`) | Implements Ebbinghaus forgetting with post-creation recall reinforcement: accessing a node resets its recency and boosts its retrieval strength $S \leftarrow S + 1$. |
 
 ---
 
@@ -117,6 +120,19 @@ SET st.status = 'IN_PROGRESS',
 WITH st
 OPTIONAL MATCH (st)-[:DEPENDS_ON]->(parent:SubTask)-[:PINNED_CONTEXT]->(ctx)
 RETURN st, collect(ctx) AS inherited_context_nodes
+```
+
+### 4.3 Dynamic Score Adaptation & Feedback Loop (vCache + MemRL)
+```cypher
+MATCH (st:SubTask {id: $subtask_id})-[:PINNED_CONTEXT]->(m)
+SET m.access_count = coalesce(m.access_count, 0) + 1,
+    m.last_accessed = $now,
+    m.utility_score = coalesce(m.utility_score, m.importance_score, 0.5) + $alpha * ($reward - coalesce(m.utility_score, m.importance_score, 0.5)),
+    m.vcache_threshold = CASE
+        WHEN $reward > 0 THEN coalesce(m.vcache_threshold, 0.78) - 0.02
+        ELSE coalesce(m.vcache_threshold, 0.78) + 0.05
+    END
+RETURN m.id AS id, m.utility_score AS new_utility, m.vcache_threshold AS new_threshold
 ```
 
 ---
