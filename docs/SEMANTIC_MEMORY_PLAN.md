@@ -227,7 +227,9 @@ Development is structured into **5 sequential, component-specific phases** execu
 
 ---
 
-### Phase 1: Bi-Temporal Schema, Provenance Bridge & Vector Indexing
+### Phase 1: Bi-Temporal Schema, Provenance Bridge & Vector Indexing `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Delivered via `feat/semantic-phase1-schema-and-provenance` — 53/53 Unit & Integration Tests Passing, Native FalkorDB Vector Index on `(:Entity)`, Pydantic v2 `EntityRecord` Domain Schemas, Auto-Vectorization Pipeline, and Full Bidirectional Grounding `[:DERIVED_FROM]`, `[:EXTRACTED_FACT]`, `[:MENTIONED_IN]`)
 
 #### Objective
 Establish the hardened data model on FalkorDB for `:Entity` nodes, `:RELATES_TO` bi-temporal edges, and the bidirectional provenance bridge connecting to Episodic Memory (`:Episode`).
