@@ -5,6 +5,8 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.core.embeddings import embedding_service
+from app.core.embeddings.reindexer import reindex_tenant_embeddings
 from app.core.falkor_client import falkor_router
 from app.memory.episodic import episodic_memory
 from app.memory.semantic import semantic_memory, EntityTriple
@@ -24,6 +26,37 @@ class FactUpsertRequest(BaseModel):
 class HippoRAGRequest(BaseModel):
     tenant_id: Optional[str] = None
     seed_entities: List[str]
+
+
+class EpisodeCreateRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    session_id: str
+    content: str
+    role: str = "user"
+    actor_id: str = "user"
+    status: str = "SUCCESS"
+    structured_payload: Optional[Dict[str, Any]] = None
+    importance_score: float = 0.5
+    utility_score: Optional[float] = None
+    vcache_threshold: float = 0.78
+    token_count: Optional[int] = None
+    user_id: Optional[str] = None
+
+
+class EpisodeSearchRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    query: str
+    session_id: Optional[str] = None
+    cross_session: bool = False
+    candidate_limit: int = 10
+    min_similarity: Optional[float] = None
+    user_id: Optional[str] = None
+
+
+class ReindexRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    user_id: Optional[str] = None
+    batch_size: int = 50
 
 
 @router.get("/graph")
@@ -138,3 +171,91 @@ def hipporag_retrieval(req: HippoRAGRequest) -> Dict[str, Any]:
     """Runs HippoRAG hybrid retrieval."""
     t_id = req.tenant_id or settings.default_tenant_id
     return semantic_memory.hipporag_retrieve(tenant_id=t_id, seed_entities=req.seed_entities)
+
+
+@router.get("/embedding-status")
+def get_embedding_status(
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    user_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Returns active embedding provider info and FalkorDB drift status."""
+    provider_info = embedding_service.get_info()
+    drift_info = falkor_router.check_graph_embedding_drift(tenant_id=tenant_id, user_id=user_id)
+    return {
+        "tenant_id": tenant_id,
+        "provider": provider_info,
+        "drift": drift_info,
+    }
+
+
+@router.post("/reindex")
+def reindex_embeddings(req: ReindexRequest) -> Dict[str, Any]:
+    """Reindexes all episodic nodes in a tenant's graph using the current active embedding provider."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    summary = reindex_tenant_embeddings(
+        tenant_id=t_id,
+        batch_size=req.batch_size,
+    )
+    return {
+        "status": "SUCCESS",
+        "summary": summary,
+    }
+
+
+@router.post("/episode")
+def create_episode(req: EpisodeCreateRequest) -> Dict[str, Any]:
+    """Ingests an episode into the episodic memory graph with vector embedding and chaining."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = episodic_memory.record_episode(
+        tenant_id=t_id,
+        session_id=req.session_id,
+        content=req.content,
+        role=req.role,
+        actor_id=req.actor_id,
+        status=req.status,
+        structured_payload=req.structured_payload,
+        importance_score=req.importance_score,
+        utility_score=req.utility_score,
+        vcache_threshold=req.vcache_threshold,
+        token_count=req.token_count,
+        user_id=req.user_id,
+    )
+    return res
+
+
+@router.get("/episodes")
+def get_episodes(
+    session_id: str = Query(..., description="Session identifier for chronological history"),
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    limit: int = Query(default=50, ge=1, le=500),
+    user_id: Optional[str] = Query(default=None),
+) -> List[Dict[str, Any]]:
+    """Retrieves chronological episodes for a session."""
+    return episodic_memory.get_session_history(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        limit=limit,
+        user_id=user_id,
+    )
+
+
+@router.post("/episodes/search")
+def search_episodes(req: EpisodeSearchRequest) -> Dict[str, Any]:
+    """Performs vector similarity search on episodic memory candidates."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    results = episodic_memory.search_episodes(
+        tenant_id=t_id,
+        query=req.query,
+        session_id=req.session_id,
+        candidate_limit=req.candidate_limit,
+        cross_session=req.cross_session,
+        min_similarity=req.min_similarity,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "query": req.query,
+        "results_count": len(results),
+        "episodes": results,
+    }
+
