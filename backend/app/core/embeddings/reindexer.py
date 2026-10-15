@@ -54,6 +54,7 @@ def reindex_tenant_embeddings(
     if total_episodes == 0:
         return {
             "status": "NOOP",
+            "tenant_id": tenant_id,
             "message": f"Tenant '{tenant_id}' has no episodes to reindex.",
             "reindexed_count": 0,
             "new_model": new_model,
