@@ -31,6 +31,7 @@ class HippoRAGRequest(BaseModel):
 class EpisodeCreateRequest(BaseModel):
     tenant_id: Optional[str] = None
     session_id: str
+    parent_session_id: Optional[str] = None
     content: str
     role: str = "user"
     actor_id: str = "user"
@@ -99,9 +100,12 @@ def get_graph_data(
             if "TaskRun" in labels or "SubTask" in labels:
                 tier = "working"  # Yellow
                 node_label = props.get("title", props.get("id", "Task"))
-            elif "Episode" in labels:
+            elif "Episode" in labels or "Session" in labels:
                 tier = "episodic"  # Blue
-                node_label = f"Ep: {props.get('id', '')}"
+                if "Session" in labels:
+                    node_label = f"Session: {props.get('id', '')}"
+                else:
+                    node_label = f"Ep: {props.get('id', '')}"
             elif "Entity" in labels:
                 tier = "semantic"  # Green
                 node_label = props.get("name", "Entity")
@@ -219,6 +223,7 @@ def create_episode(req: EpisodeCreateRequest) -> Dict[str, Any]:
         vcache_threshold=req.vcache_threshold,
         token_count=req.token_count,
         user_id=req.user_id,
+        parent_session_id=req.parent_session_id,
     )
     return res
 
@@ -237,6 +242,27 @@ def get_episodes(
         limit=limit,
         user_id=user_id,
     )
+
+
+@router.get("/sessions/lineage")
+def get_session_lineage_endpoint(
+    session_id: str = Query(..., description="Target session identifier"),
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    user_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Returns session hierarchy ancestry tree and head/tail anchors in O(1) pointer hops."""
+    t_id = tenant_id or settings.default_tenant_id
+    lineage = episodic_memory.get_session_lineage(
+        tenant_id=t_id,
+        session_id=session_id,
+        user_id=user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "session_id": session_id,
+        "lineage_count": len(lineage),
+        "ancestors": lineage,
+    }
 
 
 @router.post("/episodes/search")

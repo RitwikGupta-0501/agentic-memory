@@ -185,53 +185,42 @@ CREATE VECTOR INDEX FOR (ep:Episode) ON (ep.embedding) OPTIONS {dimension: 768, 
 
 ---
 
-### Phase 2: Zero-Race Atomic Chaining & Multi-Session Topology
+### Phase 2: Zero-Race Atomic Chaining & Multi-Session Topology `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Delivered via `feat/atomic-session-topology` — 30/30 Unit & Integration Tests Passing, Concurrency Verified)
 
 #### Objective
-Eliminate split-brain DAG branches and orphan nodes in episodic memory by migrating to a single atomic OpenCypher query that locks the session tail and provides cross-session navigation.
+Eliminate split-brain DAG branches, symmetric cycle hazards, and orphan nodes in episodic memory by migrating to an atomic boundary-anchored OpenCypher transaction with $O(1)$ pointer swapping (`:SESSION_HEAD`, `:SESSION_TAIL`, `:PARENT_SESSION`).
 
-#### Problem: The Race Condition in Current Implementation
-The current code executes:
-```python
-# Check query (Round-trip 1)
-check_res = self.router.query("MATCH (e:Episode {session_id: $session_id}) RETURN count(e)...")
-# Write query (Round-trip 2)
-if has_existing:
-    query = EPISODE_INSERT_AND_CHAIN
-else:
-    query = EPISODE_INSERT_ROOT
-```
-If Agent A (Context Agent) and Agent B (Execution Agent) record turns simultaneously, both read `count(e) == N`, and both attempt to create `(last_ep)-[:NEXT_EPISODE]->(new_ep)`. The result is a bifurcated timeline where `last_ep` has two outgoing `[:NEXT_EPISODE]` edges.
+#### Problem & Concurrency Flaw Analysis (Bug #3)
+The preliminary approach used `WHERE NOT (tail)-[:NEXT_EPISODE]->()`. Under concurrency, two coroutines concurrently creating `ep_A` and `ep_B` both saw the other as a tail candidate, creating mutual cycles (`ep_A <-> ep_B`) or leaving previous tails disconnected. Furthermore, degree checking required $O(N)$ graph scans as sessions grew.
 
-#### Solution: Single Atomic OpenCypher Transaction
-Replace the two-phase check with an atomic Cypher transaction that guarantees deterministic sequential chaining:
+#### Production Solution: Boundary Nodes & O(1) Atomic Pointer Swapping
+Anchoring session pointers onto the `(:Session)` vertex converts tail updates into serialized atomic transactions in FalkorDB:
+1. `OPTIONAL MATCH (s:Session {id: $session_id})-[old_tail_rel:SESSION_TAIL]->(prev_ep:Episode)`
+2. `DELETE old_tail_rel`
+3. `CREATE (new_ep:Episode { ... })`
+4. `CREATE (s)-[:SESSION_TAIL]->(new_ep)`
+5. `FOREACH (_ IN CASE WHEN prev_ep IS NULL THEN [1] ELSE [] END | MERGE (s)-[:SESSION_HEAD]->(new_ep))`
+6. `FOREACH (_ IN CASE WHEN prev_ep IS NOT NULL THEN [1] ELSE [] END | CREATE (prev_ep)-[:NEXT_EPISODE {delta_ms: ...}]->(new_ep))`
 
 ```cypher
-// ATOMIC_EPISODE_INSERT_AND_CHAIN
-MERGE (new_ep:Episode {id: $episode_id})
-ON CREATE SET 
-    new_ep.session_id = $session_id,
-    new_ep.role = $role,
-    new_ep.actor_id = $actor_id,
-    new_ep.content = $content,
-    new_ep.structured_payload = $structured_payload,
-    new_ep.status = $status,
-    new_ep.importance_score = $importance_score,
-    new_ep.timestamp = $timestamp,
-    new_ep.token_count = $token_count,
-    new_ep.embedding = vecf32($embedding),
-    new_ep.archived = false
-WITH new_ep
-OPTIONAL MATCH (tail:Episode {session_id: $session_id})
-WHERE tail.id <> new_ep.id AND NOT (tail)-[:NEXT_EPISODE]->()
-WITH new_ep, tail ORDER BY tail.timestamp DESC LIMIT 1
-FOREACH (_ IN CASE WHEN tail IS NOT NULL THEN [1] ELSE [] END |
-    CREATE (tail)-[:NEXT_EPISODE {
-        delta_seconds: new_ep.timestamp - tail.timestamp,
-        created_at: new_ep.timestamp
-    }]->(new_ep)
-)
-RETURN new_ep.id AS id, tail.id AS previous_id
+// ATOMIC_EPISODE_APPEND (Production Query in cypher_catalog.py)
+MERGE (s:Session {id: $session_id})
+ON CREATE SET s.tenant_id = $tenant_id, s.user_id = $user_id, s.created_at = $timestamp, s.updated_at = $timestamp, s.episode_count = 0
+WITH s
+OPTIONAL MATCH (parent:Session {id: $parent_session_id})
+WHERE $parent_session_id IS NOT NULL AND parent.id <> s.id
+FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END | MERGE (s)-[:PARENT_SESSION]->(parent))
+WITH s
+OPTIONAL MATCH (s)-[old_tail_rel:SESSION_TAIL]->(prev_ep:Episode)
+DELETE old_tail_rel
+CREATE (new_ep:Episode { ... })
+CREATE (s)-[:SESSION_TAIL]->(new_ep)
+SET s.updated_at = $timestamp, s.episode_count = coalesce(s.episode_count, 0) + 1
+FOREACH (_ IN CASE WHEN prev_ep IS NULL THEN [1] ELSE [] END | MERGE (s)-[:SESSION_HEAD]->(new_ep))
+FOREACH (_ IN CASE WHEN prev_ep IS NOT NULL THEN [1] ELSE [] END | CREATE (prev_ep)-[:NEXT_EPISODE {delta_ms: round(($timestamp - prev_ep.timestamp) * 1000.0)}]->(new_ep))
+RETURN new_ep.id AS episode_id, prev_ep.id AS previous_episode_id, s.episode_count AS seq_num
 ```
 
 ```mermaid

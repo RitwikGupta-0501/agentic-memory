@@ -78,6 +78,7 @@ class TenantGraphRouter:
             # 1. Create property range indexes
             index_queries = [
                 "CREATE INDEX FOR (e:Entity) ON (e.name)",
+                "CREATE INDEX FOR (s:Session) ON (s.id)",
                 "CREATE INDEX FOR (ep:Episode) ON (ep.id)",
                 "CREATE INDEX FOR (ep:Episode) ON (ep.session_id)",
                 "CREATE INDEX FOR (ep:Episode) ON (ep.timestamp)",

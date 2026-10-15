@@ -8,8 +8,93 @@ with Hackathon Rule #10 and Rule #3.
 from typing import Dict, Any
 
 # ==========================================
-# 1. EPISODIC MEMORY QUERIES (Priority 1A)
+# 1. EPISODIC MEMORY & SESSION TOPOLOGY QUERIES (Phase 1 & 2)
 # ==========================================
+
+SESSION_ENSURE_AND_LINK = """
+MERGE (s:Session {id: $session_id})
+ON CREATE SET
+    s.tenant_id = $tenant_id,
+    s.user_id = $user_id,
+    s.created_at = $now,
+    s.updated_at = $now,
+    s.episode_count = 0
+ON MATCH SET
+    s.updated_at = $now
+WITH s
+OPTIONAL MATCH (parent:Session {id: $parent_session_id})
+WHERE $parent_session_id IS NOT NULL AND parent.id <> s.id
+FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:PARENT_SESSION {linked_at: $now}]->(parent)
+)
+RETURN s
+"""
+
+ATOMIC_EPISODE_APPEND = """
+MERGE (s:Session {id: $session_id})
+ON CREATE SET
+    s.tenant_id = $tenant_id,
+    s.user_id = $user_id,
+    s.created_at = $timestamp,
+    s.updated_at = $timestamp,
+    s.episode_count = 0
+WITH s
+OPTIONAL MATCH (parent:Session {id: $parent_session_id})
+WHERE $parent_session_id IS NOT NULL AND parent.id <> s.id
+FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:PARENT_SESSION]->(parent)
+)
+WITH s
+OPTIONAL MATCH (s)-[old_tail_rel:SESSION_TAIL]->(prev_ep:Episode)
+DELETE old_tail_rel
+CREATE (new_ep:Episode {
+    id: $episode_id,
+    session_id: $session_id,
+    tenant_id: $tenant_id,
+    role: $role,
+    actor_id: $actor_id,
+    content: $content,
+    structured_payload: $structured_payload,
+    status: $status,
+    importance_score: $importance_score,
+    utility_score: $utility_score,
+    vcache_threshold: $vcache_threshold,
+    access_count: 0,
+    last_accessed: $timestamp,
+    timestamp: $timestamp,
+    token_count: $token_count,
+    embedding_model: $embedding_model,
+    embedding_dim: $embedding_dim,
+    embedding: vecf32($embedding),
+    archived: false
+})
+CREATE (s)-[:SESSION_TAIL]->(new_ep)
+SET s.updated_at = $timestamp,
+    s.episode_count = coalesce(s.episode_count, 0) + 1
+FOREACH (_ IN CASE WHEN prev_ep IS NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:SESSION_HEAD]->(new_ep)
+)
+FOREACH (_ IN CASE WHEN prev_ep IS NOT NULL THEN [1] ELSE [] END |
+    CREATE (prev_ep)-[:NEXT_EPISODE {
+        delta_ms: round(($timestamp - prev_ep.timestamp) * 1000.0)
+    }]->(new_ep)
+)
+RETURN new_ep.id AS episode_id, prev_ep.id AS previous_episode_id, s.episode_count AS seq_num
+"""
+
+MULTI_SESSION_LINEAGE_QUERY = """
+MATCH (curr:Session {id: $session_id})
+OPTIONAL MATCH path = (curr)-[:PARENT_SESSION*0..5]->(anc:Session)
+WITH anc ORDER BY anc.created_at ASC
+OPTIONAL MATCH (anc)-[:SESSION_HEAD]->(head:Episode)
+OPTIONAL MATCH (anc)-[:SESSION_TAIL]->(tail:Episode)
+RETURN anc.id AS session_id,
+       anc.created_at AS created_at,
+       anc.episode_count AS episode_count,
+       head.id AS head_episode_id,
+       tail.id AS tail_episode_id,
+       tail.content AS tail_summary
+"""
 
 EPISODE_INSERT_AND_CHAIN = """
 MATCH (last_ep:Episode {session_id: $session_id})
@@ -319,4 +404,7 @@ CYPHER_CATALOG: Dict[str, str] = {
     "EPISODE_VECTOR_SEARCH_CANDIDATES": EPISODE_VECTOR_SEARCH_CANDIDATES,
     "GRAPH_METADATA_GET": GRAPH_METADATA_GET,
     "GRAPH_METADATA_UPSERT": GRAPH_METADATA_UPSERT,
+    "SESSION_ENSURE_AND_LINK": SESSION_ENSURE_AND_LINK,
+    "ATOMIC_EPISODE_APPEND": ATOMIC_EPISODE_APPEND,
+    "MULTI_SESSION_LINEAGE_QUERY": MULTI_SESSION_LINEAGE_QUERY,
 }
