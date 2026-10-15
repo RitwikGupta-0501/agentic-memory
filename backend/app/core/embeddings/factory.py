@@ -107,6 +107,10 @@ class CachedEmbeddingService:
             self._cache[text] = vec
         return vec
 
+    def embed_query(self, text: str) -> List[float]:
+        """Alias for embed_text to maintain LangChain/semantic interoperability."""
+        return self.embed_text(text)
+
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """Batch embeds texts, leveraging cached results where available."""
         missing_indices = []

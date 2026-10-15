@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.embeddings import embedding_service
@@ -368,6 +368,97 @@ def retrieve_episodes_endpoint(req: EpisodeRetrieveRequest) -> Dict[str, Any]:
         "results_count": len(results),
         "episodes": results,
     }
+
+
+class EntityCreateRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=128)
+    type: str = "Concept"
+    description: Optional[str] = None
+    embedding: Optional[List[float]] = None
+    user_id: Optional[str] = None
+
+
+class EntitySearchRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    query: str = Field(..., min_length=1)
+    limit: int = Field(default=5, ge=1, le=50)
+    user_id: Optional[str] = None
+
+
+class SemanticFactRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    subject: str = Field(..., min_length=1)
+    predicate: str = Field(..., min_length=1)
+    object: str = Field(..., min_length=1)
+    episode_id: str = Field(..., min_length=1)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    cardinality: str = "SINGLE"
+    subject_type: str = "Entity"
+    object_type: str = "Entity"
+    user_id: Optional[str] = None
+
+
+@router.post("/semantic/entity")
+def create_entity_endpoint(req: EntityCreateRequest) -> Dict[str, Any]:
+    """Ensures an Entity exists with canonical slug and dense vector embedding."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = semantic_memory.ensure_entity(
+        tenant_id=t_id,
+        name=req.name,
+        type=req.type,
+        description=req.description,
+        embedding=req.embedding,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "entity": res,
+    }
+
+
+@router.post("/semantic/search")
+def search_entities_endpoint(req: EntitySearchRequest) -> Dict[str, Any]:
+    """Performs vector similarity search on Entity nodes."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    results = semantic_memory.search_entities(
+        tenant_id=t_id,
+        query=req.query,
+        limit=req.limit,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "query": req.query,
+        "limit": req.limit,
+        "results_count": len(results),
+        "entities": results,
+    }
+
+
+@router.post("/semantic/fact")
+def upsert_semantic_fact_v2(req: SemanticFactRequest) -> Dict[str, Any]:
+    """Upserts a fact with bi-temporal invalidation and bidirectional provenance linking."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = semantic_memory.upsert_fact(
+        tenant_id=t_id,
+        subject=req.subject,
+        predicate=req.predicate,
+        new_object=req.object,
+        episode_id=req.episode_id,
+        confidence=req.confidence,
+        cardinality=req.cardinality,
+        subject_type=req.subject_type,
+        object_type=req.object_type,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "fact": res,
+    }
+
 
 
 

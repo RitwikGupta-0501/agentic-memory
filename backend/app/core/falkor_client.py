@@ -78,6 +78,8 @@ class TenantGraphRouter:
             # 1. Create property range indexes
             index_queries = [
                 "CREATE INDEX FOR (e:Entity) ON (e.name)",
+                "CREATE INDEX FOR (e:Entity) ON (e.canonical_name)",
+                "CREATE INDEX FOR (e:Entity) ON (e.id)",
                 "CREATE INDEX FOR (s:Session) ON (s.id)",
                 "CREATE INDEX FOR (ep:Episode) ON (ep.id)",
                 "CREATE INDEX FOR (ep:Episode) ON (ep.session_id)",
@@ -93,16 +95,23 @@ class TenantGraphRouter:
                 except Exception:
                     pass
 
-            # 2. Dynamic Vector Index on Episode.embedding
+            # 2. Dynamic Vector Indexes on Episode.embedding and Entity.embedding
             active_dim = embedding_service.provider.dimension
-            vec_idx_query = (
-                f"CREATE VECTOR INDEX FOR (ep:Episode) ON (ep.embedding) "
-                f"OPTIONS {{dimension: {active_dim}, similarityFunction: 'cosine'}}"
-            )
-            try:
-                graph.query(vec_idx_query)
-            except Exception:
-                pass
+            vec_idx_queries = [
+                (
+                    f"CREATE VECTOR INDEX FOR (ep:Episode) ON (ep.embedding) "
+                    f"OPTIONS {{dimension: {active_dim}, similarityFunction: 'cosine'}}"
+                ),
+                (
+                    f"CREATE VECTOR INDEX FOR (e:Entity) ON (e.embedding) "
+                    f"OPTIONS {{dimension: {active_dim}, similarityFunction: 'cosine'}}"
+                ),
+            ]
+            for vq in vec_idx_queries:
+                try:
+                    graph.query(vq)
+                except Exception:
+                    pass
 
             # 3. GraphMetadata singleton
             now = time.time()
