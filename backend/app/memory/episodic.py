@@ -8,9 +8,12 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.cypher_catalog import (
+    ATOMIC_EPISODE_APPEND,
     EPISODE_INSERT_AND_CHAIN,
     EPISODE_INSERT_ROOT,
     EPISODE_VECTOR_SEARCH_CANDIDATES,
+    MULTI_SESSION_LINEAGE_QUERY,
+    SESSION_ENSURE_AND_LINK,
 )
 from app.core.embeddings.factory import embedding_service
 from app.core.falkor_client import falkor_router
@@ -21,6 +24,7 @@ class EpisodeRecord(BaseModel):
 
     id: str = Field(default_factory=lambda: f"ep_{uuid.uuid4().hex[:10]}")
     session_id: str
+    parent_session_id: Optional[str] = None
     tenant_id: str = "acme-payments"
     role: Literal["user", "agent", "tool", "system"] = "user"
     actor_id: str = "user"
@@ -62,9 +66,10 @@ class EpisodicMemoryManager:
         token_count: Optional[int] = None,
         embedding: Optional[List[float]] = None,
         user_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         episode_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Records an episode, vectorizes its content, and chains it to the preceding episode in the session."""
+        """Atomically appends an episode to the session tail pointer and maintains linear timeline."""
         now = time.time()
         start_t = time.perf_counter()
 
@@ -88,6 +93,7 @@ class EpisodicMemoryManager:
         record = EpisodeRecord(
             id=ep_id,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             tenant_id=t_id,
             role=role,
             actor_id=actor_id,
@@ -107,49 +113,49 @@ class EpisodicMemoryManager:
             archived=False,
         )
 
-        # 4. Check if there is an existing episode in this session for chaining
-        check_query = "MATCH (e:Episode {session_id: $session_id}) RETURN count(e) AS count"
-        check_res = self.router.query(
-            check_query,
-            {"session_id": session_id},
-            tenant_id=t_id,
-            user_id=user_id,
-        )
-
-        has_existing = False
-        if check_res and check_res.result_set:
-            has_existing = check_res.result_set[0][0] > 0
-
-        # 5. Serialize structured payload
+        # 4. Serialize structured payload
         payload_json = json.dumps(structured_payload) if structured_payload is not None else None
 
+        # 5. Execute single atomic session tail pointer append
         params = {
-            "episode_id": record.id,
             "session_id": record.session_id,
+            "parent_session_id": parent_session_id,
             "tenant_id": record.tenant_id,
-            "content": record.content,
+            "user_id": user_id,
+            "timestamp": record.timestamp,
+            "episode_id": record.id,
             "role": record.role,
             "actor_id": record.actor_id,
-            "status": record.status,
+            "content": record.content,
             "structured_payload": payload_json,
+            "status": record.status,
             "importance_score": record.importance_score,
             "utility_score": record.utility_score,
             "vcache_threshold": record.vcache_threshold,
-            "access_count": record.access_count,
-            "last_accessed": record.last_accessed,
-            "timestamp": record.timestamp,
             "token_count": record.token_count,
             "embedding_model": record.embedding_model,
             "embedding_dim": record.embedding_dim,
             "embedding": record.embedding,
-            "latency_ms": round((time.perf_counter() - start_t) * 1000, 2),
         }
 
-        query = EPISODE_INSERT_AND_CHAIN if has_existing else EPISODE_INSERT_ROOT
-        self.router.query(query, params, tenant_id=t_id, user_id=user_id)
+        res = self.router.query(
+            ATOMIC_EPISODE_APPEND,
+            params,
+            tenant_id=t_id,
+            user_id=user_id,
+        )
+
+        prev_ep_id = None
+        seq_num = 1
+        if res and res.result_set and res.result_set[0]:
+            row = res.result_set[0]
+            prev_ep_id = row[1]
+            seq_num = row[2]
 
         result_dict = record.model_dump()
-        result_dict["latency_ms"] = params["latency_ms"]
+        result_dict["previous_episode_id"] = prev_ep_id
+        result_dict["seq_num"] = seq_num
+        result_dict["latency_ms"] = round((time.perf_counter() - start_t) * 1000, 2)
         return result_dict
 
     def get_session_history(
@@ -267,6 +273,33 @@ class EpisodicMemoryManager:
             results = [r for r in results if r["similarity_score"] >= min_similarity]
 
         return results
+
+    def get_session_lineage(
+        self,
+        tenant_id: str,
+        session_id: str,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves session hierarchy tree and ancestor head/tail summaries in O(1) pointer hops."""
+        t_id = tenant_id or settings.default_tenant_id
+        res = self.router.query(
+            MULTI_SESSION_LINEAGE_QUERY,
+            {"session_id": session_id},
+            tenant_id=t_id,
+            user_id=user_id,
+        )
+        lineage = []
+        if res and res.result_set:
+            for row in res.result_set:
+                lineage.append({
+                    "session_id": row[0],
+                    "created_at": row[1],
+                    "episode_count": row[2] or 0,
+                    "head_episode_id": row[3],
+                    "tail_episode_id": row[4],
+                    "tail_summary": row[5],
+                })
+        return lineage
 
 
 episodic_memory = EpisodicMemoryManager()
