@@ -101,23 +101,45 @@ class ProceduralMemoryManager:
             user_id=user_id,
         )
 
-        if not res or not res.result_set or not res.result_set[0]:
+        if not res or not res.result_set:
             return None
 
-        row = res.result_set[0]
-        proc_node = row[0]
-        steps_nodes = row[1] if len(row) > 1 and row[1] else []
-        guardrails_nodes = row[2] if len(row) > 2 and row[2] else []
+        proc_props = {}
+        steps_map = {}
+        guardrails_map = {}
 
-        proc_props = getattr(proc_node, "properties", {})
-        steps = [getattr(s, "properties", {}) for s in steps_nodes if s]
-        guardrails = [getattr(g, "properties", {}) for g in guardrails_nodes if g]
+        for row in res.result_set:
+            if not row:
+                continue
+            proc_node = row[0]
+            if proc_node and not proc_props:
+                proc_props = getattr(proc_node, "properties", {})
+
+            steps_nodes = row[1] if len(row) > 1 and row[1] else []
+            for s in steps_nodes:
+                if s:
+                    s_props = getattr(s, "properties", {})
+                    s_id = s_props.get("id")
+                    if s_id and s_id not in steps_map and s_id != proc_props.get("id"):
+                        steps_map[s_id] = s_props
+
+            guardrails_nodes = row[2] if len(row) > 2 and row[2] else []
+            for g in guardrails_nodes:
+                if g:
+                    g_props = getattr(g, "properties", {})
+                    g_id = g_props.get("id")
+                    if g_id and g_id not in guardrails_map:
+                        guardrails_map[g_id] = g_props
+
+        if not proc_props:
+            return None
 
         return {
             "procedure": proc_props,
-            "steps": steps,
-            "guardrails": guardrails,
+            "steps": list(steps_map.values()),
+            "guardrails": list(guardrails_map.values()),
         }
+
 
     def attach_guardrail(
         self,
