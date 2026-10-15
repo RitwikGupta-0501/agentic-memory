@@ -204,6 +204,40 @@ RETURN ep, similarity_score
 ORDER BY similarity_score DESC
 """
 
+EPISODE_HYBRID_CANDIDATE_FETCH = """
+CALL db.idx.vector.queryNodes('Episode', 'embedding', $candidate_limit, vecf32($query_vec))
+YIELD node AS ep, score AS raw_score
+WHERE coalesce(ep.archived, false) = false
+  AND ($cross_session = true OR ep.session_id = $session_id)
+RETURN ep, raw_score
+"""
+
+EPISODE_FALLBACK_SCAN_FETCH = """
+MATCH (ep:Episode)
+WHERE coalesce(ep.archived, false) = false
+  AND ($cross_session = true OR ep.session_id = $session_id)
+RETURN ep, 0.5 AS raw_score
+ORDER BY ep.timestamp DESC
+LIMIT $candidate_limit
+"""
+
+EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND = """
+UNWIND $episode_ids AS ep_id
+MATCH (ep:Episode {id: ep_id})
+SET ep.access_count = coalesce(ep.access_count, 0) + CASE WHEN $touch = true THEN 1 ELSE 0 END,
+    ep.last_accessed = CASE WHEN $touch = true THEN $now ELSE coalesce(ep.last_accessed, ep.timestamp) END
+WITH ep
+OPTIONAL MATCH (ctx)-[r:DERIVED_FROM|PINNED_CONTEXT|TRIGGERED_BY|CONSOLIDATES]->(ep)
+RETURN ep.id AS episode_id,
+       ep.access_count AS access_count,
+       ep.last_accessed AS last_accessed,
+       collect(DISTINCT {
+           label: labels(ctx)[0],
+           id: coalesce(ctx.id, ctx.name),
+           rel_type: type(r)
+       }) AS provenance_links
+"""
+
 GRAPH_METADATA_GET = """
 MATCH (m:GraphMetadata)
 RETURN m.active_embedding_model AS active_model,
@@ -455,4 +489,7 @@ CYPHER_CATALOG: Dict[str, str] = {
     "MULTI_SESSION_LINEAGE_QUERY": MULTI_SESSION_LINEAGE_QUERY,
     "EPISODE_UTILITY_FEEDBACK_UPDATE": EPISODE_UTILITY_FEEDBACK_UPDATE,
     "MEMORY_UTILITY_FEEDBACK_UPDATE": MEMORY_UTILITY_FEEDBACK_UPDATE,
+    "EPISODE_HYBRID_CANDIDATE_FETCH": EPISODE_HYBRID_CANDIDATE_FETCH,
+    "EPISODE_FALLBACK_SCAN_FETCH": EPISODE_FALLBACK_SCAN_FETCH,
+    "EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND": EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND,
 }
