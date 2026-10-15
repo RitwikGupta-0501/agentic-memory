@@ -94,7 +94,39 @@ class MultiAgentCoordinationEngine:
             "message": f"Atomically locked SubTask 1: '{st1_claim['title'] if st1_claim else 'Triage'}'",
             "cypher": "MATCH (t:TaskRun)-[:HAS_SUBTASK]->(st:SubTask {status: 'PENDING'}) SET st.status = 'IN_PROGRESS', st.locked_by = 'Context & Triage Agent'...",
         }
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
+
+        # Context Agent recalls historical interactions via Park et al. 3-factor retrieval
+        historical_episodes = episodic_memory.retrieve_episodes(
+            tenant_id=tenant_id,
+            query=user_prompt,
+            session_id=session_id,
+            cross_session=True,
+            top_k=3,
+            user_id=user_id,
+        )
+
+        recalled_count = len(historical_episodes)
+        top_score = historical_episodes[0]["composite_score"] if historical_episodes else 0.0
+
+        yield {
+            "type": "episodic_retrieval_event",
+            "agent": "Context & Triage Agent",
+            "phase": "retrieval",
+            "message": f"Park et al. 3-factor retrieval matched {recalled_count} historical episode(s) (top composite: {top_score}).",
+            "cypher": "CALL db.idx.vector.queryNodes('Episode'...) + MemoryBank decay + MemRL utility",
+            "retrieved_episodes": [
+                {
+                    "id": h["episode"]["id"],
+                    "composite_score": h["composite_score"],
+                    "recency": h["recency_score"],
+                    "importance": h["importance_score"],
+                    "relevance": h["relevance_score"],
+                }
+                for h in historical_episodes
+            ],
+        }
+        await asyncio.sleep(0.4)
 
         # Context Agent inspects Semantic Knowledge Graph
         triples = semantic_memory.extract_triples_from_text(user_prompt)
