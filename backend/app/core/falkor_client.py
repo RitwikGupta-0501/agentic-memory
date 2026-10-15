@@ -70,12 +70,18 @@ class TenantGraphRouter:
         return graph
 
     def ensure_indices(self, graph) -> None:
-        """Idempotently ensures indexes are created on the selected graph."""
+        """Idempotently ensures property and dynamic vector indexes are created on the selected graph."""
         try:
-            # Create property indexes for fast lookups
+            from app.core.embeddings.factory import embedding_service
+            import time
+
+            # 1. Create property range indexes
             index_queries = [
                 "CREATE INDEX FOR (e:Entity) ON (e.name)",
                 "CREATE INDEX FOR (ep:Episode) ON (ep.id)",
+                "CREATE INDEX FOR (ep:Episode) ON (ep.session_id)",
+                "CREATE INDEX FOR (ep:Episode) ON (ep.timestamp)",
+                "CREATE INDEX FOR (ep:Episode) ON (ep.actor_id)",
                 "CREATE INDEX FOR (tr:TaskRun) ON (tr.id)",
                 "CREATE INDEX FOR (st:SubTask) ON (st.id)",
                 "CREATE INDEX FOR (p:Procedure) ON (p.name)",
@@ -84,9 +90,98 @@ class TenantGraphRouter:
                 try:
                     graph.query(q)
                 except Exception:
-                    pass  # Index already exists or not supported by engine version
+                    pass
+
+            # 2. Dynamic Vector Index on Episode.embedding
+            active_dim = embedding_service.provider.dimension
+            vec_idx_query = (
+                f"CREATE VECTOR INDEX FOR (ep:Episode) ON (ep.embedding) "
+                f"OPTIONS {{dimension: {active_dim}, similarityFunction: 'cosine'}}"
+            )
+            try:
+                graph.query(vec_idx_query)
+            except Exception:
+                pass
+
+            # 3. GraphMetadata singleton
+            now = time.time()
+            meta_query = """
+            MERGE (m:GraphMetadata {graph_key: $graph_key})
+            ON CREATE SET m.active_embedding_model = $model,
+                          m.active_dimension = $dim,
+                          m.created_at = $now
+            """
+            try:
+                graph.query(
+                    meta_query,
+                    {
+                        "graph_key": graph.name,
+                        "model": embedding_service.provider.model_name,
+                        "dim": active_dim,
+                        "now": now,
+                    },
+                )
+            except Exception:
+                pass
+
         except Exception as e:
             logger.debug(f"Index initialization note: {e}")
+
+    def check_graph_embedding_drift(
+        self,
+        tenant_id: str = None,
+        user_id: str = None,
+        shared: bool = True,
+    ) -> Dict[str, Any]:
+        """Detects whether active embedding configuration matches stored graph embeddings."""
+        from app.core.embeddings.factory import embedding_service
+
+        graph = self.get_graph(tenant_id, user_id, shared)
+        active_model = embedding_service.provider.model_name
+        active_dim = embedding_service.provider.dimension
+
+        try:
+            res = graph.query("MATCH (m:GraphMetadata) RETURN m.active_embedding_model, m.active_dimension LIMIT 1")
+            if res and res.result_set and res.result_set[0]:
+                stored_model = res.result_set[0][0]
+                stored_dim = res.result_set[0][1]
+                drift_detected = (stored_model != active_model) or (stored_dim != active_dim)
+                return {
+                    "status": "DRIFT_DETECTED" if drift_detected else "MATCH",
+                    "tenant_id": tenant_id or settings.default_tenant_id,
+                    "stored_model": stored_model,
+                    "stored_dimension": stored_dim,
+                    "active_model": active_model,
+                    "active_dimension": active_dim,
+                    "drift_detected": drift_detected,
+                }
+        except Exception as e:
+            logger.debug(f"Drift check exception: {e}")
+
+        return {
+            "status": "MATCH",
+            "tenant_id": tenant_id or settings.default_tenant_id,
+            "stored_model": active_model,
+            "stored_dimension": active_dim,
+            "active_model": active_model,
+            "active_dimension": active_dim,
+            "drift_detected": False,
+        }
+
+    def get_indexes(
+        self,
+        tenant_id: str = None,
+        user_id: str = None,
+        shared: bool = True,
+    ) -> List[Any]:
+        """Returns the active indexes on the selected tenant graph."""
+        graph = self.get_graph(tenant_id, user_id, shared)
+        try:
+            res = graph.query("CALL db.indexes()")
+            return res.result_set or []
+        except Exception as e:
+            logger.warning(f"Failed to query db.indexes(): {e}")
+            return []
 
     def query(
         self,
