@@ -349,18 +349,20 @@ class EpisodicMemoryManager:
             "cross_session": cross_session or (session_id is None),
         }
 
-        res = self.router.query(
-            EPISODE_HYBRID_CANDIDATE_FETCH,
-            params,
-            tenant_id=t_id,
-            user_id=user_id,
-        )
-
         candidate_rows = []
-        if res and res.result_set:
-            candidate_rows = res.result_set
+        try:
+            res = self.router.query(
+                EPISODE_HYBRID_CANDIDATE_FETCH,
+                params,
+                tenant_id=t_id,
+                user_id=user_id,
+            )
+            if res and res.result_set:
+                candidate_rows = res.result_set
+        except Exception:
+            candidate_rows = []
 
-        # Fallback scan if vector ANN returns 0 candidates (e.g. intra-session sparsity)
+        # Fallback scan if vector ANN returns 0 candidates or index error (e.g. intra-session sparsity)
         if not candidate_rows:
             fallback_res = self.router.query(
                 EPISODE_FALLBACK_SCAN_FETCH,
