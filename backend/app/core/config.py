@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     anthropic_api_key: str = ""
 
+    # Embedding Settings
+    embedding_provider: str = "mock"  # mock, gemini, openai, ollama
+    embedding_dimension: int = 768
+    embedding_model_name: str = "models/text-embedding-004"
+    ollama_base_url: str = "http://localhost:11434"
+    embedding_cache_size: int = 1024
+    auto_reindex_on_model_change: bool = False
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
