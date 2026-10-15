@@ -274,7 +274,103 @@ CREATE (s)-[new_r:RELATES_TO {
     source_episode: $episode_id
 }]->(new_o)
 CREATE (new_o)-[:DERIVED_FROM]->(ep)
+CREATE (s)-[:MENTIONED_IN {timestamp: $now}]->(ep)
+CREATE (new_o)-[:MENTIONED_IN {timestamp: $now}]->(ep)
+CREATE (ep)-[:EXTRACTED_FACT {timestamp: $now, predicate: $predicate}]->(new_o)
 RETURN invalidated_count, new_r
+"""
+
+SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING = """
+MERGE (e:Entity {name: $name})
+ON CREATE SET
+    e.id = $id,
+    e.canonical_name = $canonical_name,
+    e.type = $type,
+    e.aliases = [$name],
+    e.description = $description,
+    e.created_at = $now,
+    e.updated_at = $now,
+    e.embedding = CASE WHEN $embedding IS NOT NULL THEN vecf32($embedding) ELSE NULL END
+ON MATCH SET
+    e.updated_at = $now,
+    e.type = coalesce($type, e.type),
+    e.embedding = CASE WHEN $embedding IS NOT NULL THEN vecf32($embedding) ELSE e.embedding END
+RETURN e.id AS id, e.name AS name, e.canonical_name AS canonical_name, e.type AS type
+"""
+
+SEMANTIC_PROVENANCE_UPSERT_AND_LINK = """
+// 1. Invalidate conflicting functional single-valued active relations if requested
+MATCH (s:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
+WHERE old_r.valid_to IS NULL 
+  AND $cardinality = 'SINGLE' 
+  AND old_o.name <> $object
+SET old_r.valid_to = $now,
+    old_r.invalidated_by_episode = $episode_id
+WITH count(old_r) AS invalidated_count
+
+// 2. Ensure Subject Entity exists
+MERGE (s:Entity {name: $subject})
+ON CREATE SET
+    s.id = $subject_id,
+    s.canonical_name = $subject_canonical,
+    s.type = $subject_type,
+    s.aliases = [$subject],
+    s.created_at = $now,
+    s.updated_at = $now,
+    s.embedding = CASE WHEN $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE NULL END
+ON MATCH SET
+    s.updated_at = $now
+
+// 3. Ensure Object Entity exists
+MERGE (o:Entity {name: $object})
+ON CREATE SET
+    o.id = $object_id,
+    o.canonical_name = $object_canonical,
+    o.type = $object_type,
+    o.aliases = [$object],
+    o.created_at = $now,
+    o.updated_at = $now,
+    o.embedding = CASE WHEN $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE NULL END
+ON MATCH SET
+    o.updated_at = $now
+
+// 4. Create new active bi-temporal edge
+CREATE (s)-[new_r:RELATES_TO {
+    predicate: $predicate,
+    cardinality: $cardinality,
+    confidence: $confidence,
+    valid_from: $now,
+    valid_to: NULL,
+    transaction_from: $now,
+    source_episode: $episode_id
+}]->(o)
+
+// 5. Establish full bidirectional cross-layer provenance to Episode
+WITH invalidated_count, new_r, s, o
+MATCH (ep:Episode {id: $episode_id})
+MERGE (s)-[:MENTIONED_IN {timestamp: $now}]->(ep)
+MERGE (o)-[:MENTIONED_IN {timestamp: $now}]->(ep)
+MERGE (o)-[:DERIVED_FROM {timestamp: $now}]->(ep)
+MERGE (ep)-[:EXTRACTED_FACT {timestamp: $now, predicate: $predicate}]->(o)
+
+RETURN invalidated_count,
+       s.name AS subject,
+       new_r.predicate AS predicate,
+       o.name AS object,
+       new_r.valid_from AS valid_from,
+       ep.id AS source_episode
+"""
+
+SEMANTIC_ENTITY_VECTOR_SEARCH = """
+CALL db.idx.vector.queryNodes('Entity', 'embedding', $limit, vecf32($query_vec))
+YIELD node AS e, score
+RETURN e.id AS id,
+       e.name AS name,
+       e.canonical_name AS canonical_name,
+       e.type AS type,
+       e.aliases AS aliases,
+       (1.0 - score) AS similarity
+ORDER BY similarity DESC
 """
 
 HIPPORAG_HYBRID_RETRIEVAL = """
@@ -492,4 +588,7 @@ CYPHER_CATALOG: Dict[str, str] = {
     "EPISODE_HYBRID_CANDIDATE_FETCH": EPISODE_HYBRID_CANDIDATE_FETCH,
     "EPISODE_FALLBACK_SCAN_FETCH": EPISODE_FALLBACK_SCAN_FETCH,
     "EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND": EPISODE_BATCH_RECALL_TOUCH_AND_EXPAND,
+    "SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING": SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING,
+    "SEMANTIC_PROVENANCE_UPSERT_AND_LINK": SEMANTIC_PROVENANCE_UPSERT_AND_LINK,
+    "SEMANTIC_ENTITY_VECTOR_SEARCH": SEMANTIC_ENTITY_VECTOR_SEARCH,
 }
