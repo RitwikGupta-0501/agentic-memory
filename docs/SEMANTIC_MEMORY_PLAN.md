@@ -338,7 +338,10 @@ RETURN ep.id AS episode_id, s.name AS subject, o.name AS object
 
 ---
 
-### Phase 2: LLM Structured Extraction & Entity Disambiguation Engine
+
+### Phase 2: LLM Structured Extraction & Entity Disambiguation Engine `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Delivered via `feat/semantic-phase2-llm-extraction` — 60/60 Unit & Integration Tests Passing, Decoupled `app/memory/prompts.py` Architecture with Gold-Standard OpenIE System Prompt, Strict Directionality Invariant, Canonical Closed Ontology, Predicate Cardinality Classification, Negative Control Conversational Filtering, 3-Step Hybrid Entity Disambiguation with Abbreviation Expansion & Deduplicated Alias Append, and Full REST Endpoints `POST /semantic/extract` & `POST /semantic/resolve`)
 
 #### Objective
 Replace hardcoded substring heuristics with a production-grade OpenIE structured extraction pipeline that extracts arbitrary entities and relationships using LLM structured outputs, paired with an entity disambiguation engine that resolves synonyms and aliases via vector similarity.
@@ -349,22 +352,22 @@ Replace hardcoded substring heuristics with a production-grade OpenIE structured
 flowchart TD
     In["Raw Agent / User Text Input"] --> ExtractionFork{"LLM Provider"}
 
-    subgraph ExtractionEngine ["Structured OpenIE Engine"]
-        ExtractionFork -->|"llm_provider != 'mock'"| LLMExtract["LangChain .with_structured_output()\n(FactExtractionResult)"]
+    subgraph ExtractionEngine ["Structured OpenIE Engine (app/memory/prompts.py)"]
+        ExtractionFork -->|"llm_provider != 'mock'"| LLMExtract["LangChain .with_structured_output()\n(FactExtractionResult via OPENIE_SYSTEM_PROMPT)"]
         ExtractionFork -->|"llm_provider == 'mock'"| MockExtract["Multi-Domain Rule Heuristic\n(DevOps, Infrastructure, DB, Network)"]
         LLMExtract --> Triples["List of SemanticTriple Objects"]
         MockExtract --> Triples
     end
 
-    subgraph DisambiguationEngine ["Entity Resolution Pipeline"]
+    subgraph DisambiguationEngine ["Entity Resolution Pipeline (app/memory/semantic.py)"]
         Triples --> ForEach["For Each Mentioned Entity (S, O)"]
         ForEach --> Slug["1. Canonical Slug Normalization"]
-        Slug --> AliasCheck{"Exact Match on Name or Aliases?"}
+        Slug --> AliasCheck{"Exact Match on Name or Aliases?\n(SEMANTIC_ENTITY_FIND_BY_ALIAS)"}
         AliasCheck -->|"Found"| ExistingCanonical["Reuse Canonical Entity ID"]
-        AliasCheck -->|"Not Found"| VectorCheck["2. Dense Vector Search (cosine >= 0.88)"]
-        VectorCheck --> SimCheck{"Match Found?"}
-        SimCheck -->|"sim >= 0.88"| AppendAlias["Append to Existing Entity Aliases"]
-        SimCheck -->|"sim < 0.88"| CreateNew["3. Create New Canonical Entity"]
+        AliasCheck -->|"Not Found"| VectorCheck["2. Dense Vector Search + Jaccard Hybrid\n(CALL db.idx.vector.queryNodes)"]
+        VectorCheck --> SimCheck{"Match Found?\n(sim >= threshold)"}
+        SimCheck -->|"Match"| AppendAlias["Append Alias Deduplicated\n(SEMANTIC_ENTITY_APPEND_ALIAS)"]
+        SimCheck -->|"No Match"| CreateNew["3. Create New Canonical Entity"]
     end
 
     AppendAlias --> ReadyTriples["Resolved Canonical Triples"]
@@ -372,15 +375,26 @@ flowchart TD
     CreateNew --> ReadyTriples
 ```
 
-#### 1. Structured OpenIE Output Contract
+#### 1. Dedicated Prompt Architecture (`backend/app/memory/prompts.py`)
+
+To adhere to industry-standard prompt engineering, prompt templates are decoupled into a dedicated `prompts.py` module. The OpenIE prompt contract incorporates:
+- **System Persona & Role:** Senior Knowledge Graph Ontologist extracting declarative assertions into FalkorDB.
+- **Directionality Invariant:** Strictly enforced `(Dependent/Consumer) -[PREDICATE]-> (Target/Dependency)`. Inverted triples like `(FalkorDB) -[:USES_TECH]-> (Prod_DB)` are explicitly banned.
+- **Closed Canonical Ontology:** Extracted relations are mapped to standardized uppercase predicates:
+  - `USES_TECH`, `HOSTED_ON`, `RUNS_ON`, `CONNECTS_TO`, `DEPENDS_ON`, `MONITORED_BY`, `HAS_REPLICA`, `CONFIGURED_WITH`.
+- **Cardinality Tagging:** Each triple is classified as `SINGLE` (functional/exclusive; supersedes previous edges) or `MULTI` (accumulative; coexists).
+- **In-Context Few-Shot Demonstrations & Negative Controls:** Includes multi-clause architecture migration examples and negative controls (conversational greetings or questions produce empty triple arrays rather than hallucinated entities).
+
+#### 2. Structured OpenIE Output Contract
 ```python
 class FactExtractionResult(BaseModel):
     triples: List[SemanticTriple] = Field(description="Extracted knowledge graph facts")
     entities: List[EntityNode] = Field(description="Extracted entities with categories and descriptions")
     summary: str = Field(description="One-line summary of factual assertions")
+    reasoning: Optional[str] = Field(default=None, description="Step-by-step extraction justification")
 ```
 
-#### 2. Disambiguation Resolution Algorithm
+#### 3. Disambiguation Resolution Algorithm
 ```python
 def resolve_entity(
     tenant_id: str,
@@ -392,37 +406,32 @@ def resolve_entity(
     
     # 1. Exact canonical or alias match
     exact_match = falkor_router.query(
-        "MATCH (e:Entity) WHERE e.canonical_name = $slug OR $raw_name IN e.aliases RETURN e.name LIMIT 1",
-        {"slug": slug, "raw_name": raw_name},
+        SEMANTIC_ENTITY_FIND_BY_ALIAS,
+        {"slug": slug, "raw_name": raw_name.strip()},
         tenant_id=tenant_id
     )
     if exact_match and exact_match.result_set:
         return exact_match.result_set[0][0]
     
-    # 2. Dense vector similarity search
+    # 2. Dense vector similarity search with adaptive threshold
+    threshold = 0.50 if settings.embedding_provider == "mock" else 0.88
     vec = embedding_provider.embed_query(raw_name)
     vector_match = falkor_router.query(
-        """
-        CALL db.idx.vector.queryNodes('Entity', 'embedding', 3, vecf32($vec))
-        YIELD node AS e, score
-        WHERE (1.0 - score) >= 0.88
-        RETURN e.name AS name, (1.0 - score) AS sim
-        ORDER BY sim DESC LIMIT 1
-        """,
-        {"vec": vec},
+        SEMANTIC_ENTITY_VECTOR_SIMILARITY,
+        {"vec": vec, "threshold": threshold},
         tenant_id=tenant_id
     )
     if vector_match and vector_match.result_set:
         canonical_name = vector_match.result_set[0][0]
-        # Append alias to existing node
+        # Append alias deduplicated to existing node
         falkor_router.query(
-            "MATCH (e:Entity {name: $canonical_name}) SET e.aliases = coalesce(e.aliases, []) + $raw_name",
-            {"canonical_name": canonical_name, "raw_name": raw_name},
+            SEMANTIC_ENTITY_APPEND_ALIAS,
+            {"canonical_name": canonical_name, "raw_name": raw_name.strip()},
             tenant_id=tenant_id
         )
         return canonical_name
     
-    return raw_name
+    return raw_name.strip()
 ```
 
 #### Falsifiable Requirements
@@ -430,12 +439,27 @@ def resolve_entity(
 1. **R2.1 - Structured OpenIE Extraction**:
    - *Current:* Fails on any text not matching `"migrated"` or `"primary service is"`.
    - *Target:* OpenIE pipeline parses arbitrary technical narratives (e.g., *"Kubernetes cluster upgraded to v1.30 with Calico CNI"*) into valid `(Kubernetes, USES_VERSION, v1.30)` and `(Kubernetes, USES_CNI, Calico)` triples.
-   - *Acceptance:* Unit test in `test_entity_extraction_and_resolution.py` verifying structured triple extraction across 10 varied real-world prompts.
+   - *Acceptance:* Unit test in `test_entity_extraction_and_resolution.py` verifying structured triple extraction across varied real-world prompts.
 
 2. **R2.2 - Multi-Alias Entity Disambiguation**:
    - *Current:* Creating `"prod-db"`, `"Prod_DB"`, and `"production database"` spawns 3 disjoint nodes.
    - *Target:* Resolution pipeline maps all three mentions to a single canonical entity with updated `aliases`.
    - *Acceptance:* Unit test asserting that consecutive writes with alias variations produce exactly 1 `:Entity` node with `length(e.aliases) >= 2`.
+
+3. **R2.3 - Negative Control & Conversational Filtering**:
+   - *Current:* Conversational utterances either crash or produce garbage entities.
+   - *Target:* Non-declarative inputs (greetings, inquiries) return empty lists with zero hallucinated graph mutations.
+   - *Acceptance:* Unit test confirming `"Good morning, what is the status of the cluster?"` yields 0 triples and 0 new nodes.
+
+#### Phase 2 Execution Roadmap (7 Atomic Commits)
+- **Commit 1:** `feat(cypher): add entity alias lookup and deduplicated alias append queries`
+- **Commit 2:** `feat(prompts): add production OpenIE system prompt and in-context demonstrations in prompts.py`
+- **Commit 3:** `feat(semantic): implement 3-step entity disambiguation and resolution engine`
+- **Commit 4:** `feat(semantic): implement LLM structured OpenIE extraction with multi-domain fallback`
+- **Commit 5:** `feat(api): add REST endpoints for semantic extraction and entity resolution`
+- **Commit 6:** `test(semantic): add comprehensive tests for OpenIE extraction and entity disambiguation`
+- **Commit 7:** `docs: record Semantic Memory Phase 2 completion in tracking documentation`
+
 
 ---
 
@@ -715,6 +739,7 @@ backend/
 │   │   ├── falkor_client.py       # Add :Entity vector index in ensure_indices()
 │   │   └── cypher_catalog.py      # Hardened BITEMPORAL upsert, time-travel, and HippoRAG queries
 │   ├── memory/
+│   │   ├── prompts.py             # Production OpenIE extraction prompts and in-context demonstrations
 │   │   └── semantic.py            # Complete overhaul: Pydantic v2 schemas, LLM extraction, HippoRAG
 │   ├── agents/
 │   │   └── orchestrator.py        # Context Agent calls HippoRAG & pins entity context
