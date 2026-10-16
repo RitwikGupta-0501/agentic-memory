@@ -17,6 +17,10 @@ from app.core.cypher_catalog import (
     SEMANTIC_ENTITY_FIND_BY_ALIAS,
     SEMANTIC_ENTITY_APPEND_ALIAS,
     SEMANTIC_ENTITY_VECTOR_SIMILARITY,
+    SEMANTIC_TIME_TRAVEL_SNAPSHOT,
+    SEMANTIC_ENTITY_EVOLUTION_TIMELINE,
+    SEMANTIC_TIME_TRAVEL_SUBGRAPH,
+    SEMANTIC_CYTOSCAPE_TIME_TRAVEL,
 )
 from app.core.falkor_client import falkor_router
 from app.core.embeddings.factory import embedding_service
@@ -402,6 +406,37 @@ class SemanticMemoryManager:
             "source_episode": episode_id,
             "cardinality": card_str,
         }
+
+    def get_snapshot(
+        self,
+        tenant_id: str,
+        as_of: Optional[float] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Returns the full knowledge graph state active at timestamp as_of."""
+        target_t = float(as_of) if as_of is not None else time.time()
+        res = self.router.query(
+            SEMANTIC_TIME_TRAVEL_SNAPSHOT,
+            {"as_of": target_t},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        facts = []
+        if res and res.result_set:
+            for row in res.result_set:
+                facts.append({
+                    "subject": row[0],
+                    "subject_type": row[1],
+                    "predicate": row[2],
+                    "cardinality": row[3],
+                    "confidence": float(row[4]),
+                    "valid_from": float(row[5]),
+                    "valid_to": float(row[6]) if row[6] is not None else None,
+                    "source_episode": row[7],
+                    "object": row[8],
+                    "object_type": row[9],
+                })
+        return facts
 
 
     def search_entities(
