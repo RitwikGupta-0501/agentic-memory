@@ -49,3 +49,21 @@ def test_working_memory_atomic_claim_syntax():
     assert "SET st.status = 'IN_PROGRESS'" in query
     assert "st.locked_by = $agent_id" in query
 
+
+def test_semantic_alias_and_resolution_query_syntax():
+    """Verifies entity alias lookup, append, and vector similarity Cypher syntax."""
+    alias_q = CYPHER_CATALOG["SEMANTIC_ENTITY_FIND_BY_ALIAS"]
+    assert "e.canonical_name = $slug" in alias_q
+    assert "$raw_name IN coalesce(e.aliases, [])" in alias_q
+    assert "toLower(e.name) = toLower($raw_name)" in alias_q
+
+    append_q = CYPHER_CATALOG["SEMANTIC_ENTITY_APPEND_ALIAS"]
+    assert "e.aliases = CASE" in append_q
+    assert "coalesce(e.aliases, []) + $raw_name" in append_q
+
+    vec_q = CYPHER_CATALOG["SEMANTIC_ENTITY_VECTOR_SIMILARITY"]
+    assert "CALL db.idx.vector.queryNodes('Entity', 'embedding'" in vec_q
+    assert "(1.0 - score) AS similarity" in vec_q
+    assert "similarity >= $threshold" in vec_q
+
+
