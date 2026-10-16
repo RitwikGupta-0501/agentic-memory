@@ -86,4 +86,21 @@ def test_semantic_time_travel_cypher_syntax():
     assert "$include_invalidated = true" in cyto_q
 
 
+def test_hipporag_query_syntax():
+    """Verifies that HippoRAG vector, subgraph expansion, and episode grounding queries contain required clauses."""
+    vec_q = CYPHER_CATALOG["HIPPORAG_SEED_VECTOR_SEARCH"]
+    assert "CALL db.idx.vector.queryNodes('Entity', 'embedding'" in vec_q
+    assert "similarity >= $min_similarity" in vec_q
+
+    subgraph_q = CYPHER_CATALOG["HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION"]
+    assert "path = (seed)-[r:RELATES_TO*1..3]-(target:Entity)" in subgraph_q
+    assert "length(path) <= $max_hops" in subgraph_q
+    assert "edge.valid_to IS NULL OR edge.valid_to > $as_of" in subgraph_q
+
+    grounding_q = CYPHER_CATALOG["HIPPORAG_EPISODE_GROUNDING_EXPANSION"]
+    assert "MATCH (e)-[r:DERIVED_FROM|MENTIONED_IN]->(ep:Episode)" in grounding_q
+    assert "invalidated_count = 0" in grounding_q
+    assert "coalesce(ep.timestamp, r.timestamp, 0.0) <= $as_of" in grounding_q
+
+
 

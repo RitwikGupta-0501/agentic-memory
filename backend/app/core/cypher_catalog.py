@@ -523,6 +523,58 @@ OPTIONAL MATCH (neighbor)-[:DERIVED_FROM]->(ep:Episode)
 RETURN seed, collect(path) AS paths, collect(ep) AS episodes
 """
 
+HIPPORAG_SEED_VECTOR_SEARCH = """
+CALL db.idx.vector.queryNodes('Entity', 'embedding', $candidate_limit, vecf32($query_vec))
+YIELD node AS e, score
+WITH e, (1.0 - score) AS similarity
+WHERE similarity >= $min_similarity
+RETURN e.name AS name,
+       e.canonical_name AS canonical_name,
+       e.type AS type,
+       coalesce(e.aliases, []) AS aliases,
+       similarity
+ORDER BY similarity DESC
+"""
+
+HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION = """
+MATCH (seed:Entity)
+WHERE (seed.name IN $seed_names OR seed.canonical_name IN $seed_names)
+  AND coalesce(seed.created_at, 0.0) <= $as_of
+MATCH path = (seed)-[r:RELATES_TO*1..3]-(target:Entity)
+WHERE length(path) <= $max_hops
+  AND all(node IN nodes(path) WHERE coalesce(node.created_at, 0.0) <= $as_of)
+  AND all(edge IN relationships(path) WHERE 
+      edge.valid_from <= $as_of 
+      AND (edge.valid_to IS NULL OR edge.valid_to > $as_of)
+  )
+UNWIND relationships(path) AS edge
+RETURN DISTINCT startNode(edge).name AS source,
+       edge.predicate AS predicate,
+       endNode(edge).name AS target,
+       coalesce(edge.confidence, 1.0) AS weight,
+       edge.valid_from AS valid_from,
+       edge.valid_to AS valid_to
+"""
+
+HIPPORAG_EPISODE_GROUNDING_EXPANSION = """
+MATCH (e:Entity)
+WHERE e.name IN $entity_names
+MATCH (e)-[r:DERIVED_FROM|MENTIONED_IN]->(ep:Episode)
+WHERE coalesce(ep.archived, false) = false
+  AND coalesce(ep.timestamp, r.timestamp, 0.0) <= $as_of
+OPTIONAL MATCH (s:Entity)-[old_rel:RELATES_TO {source_episode: ep.id}]->(t:Entity)
+WHERE old_rel.valid_to IS NOT NULL AND old_rel.valid_to <= $as_of
+WITH e, r, ep, count(old_rel) AS invalidated_count
+WHERE invalidated_count = 0
+RETURN e.name AS entity,
+       type(r) AS link_type,
+       ep.id AS episode_id,
+       coalesce(ep.content, '') AS content,
+       coalesce(ep.role, 'system') AS role,
+       coalesce(ep.utility_score, ep.importance_score, 0.5) AS importance_score,
+       coalesce(ep.timestamp, 0.0) AS timestamp
+"""
+
 # ==========================================
 # 3. WORKING MEMORY & BLACKBOARD COORDINATION (Priority 2)
 # ==========================================
@@ -739,5 +791,8 @@ CYPHER_CATALOG: Dict[str, str] = {
     "SEMANTIC_ENTITY_EVOLUTION_TIMELINE": SEMANTIC_ENTITY_EVOLUTION_TIMELINE,
     "SEMANTIC_TIME_TRAVEL_SUBGRAPH": SEMANTIC_TIME_TRAVEL_SUBGRAPH,
     "SEMANTIC_CYTOSCAPE_TIME_TRAVEL": SEMANTIC_CYTOSCAPE_TIME_TRAVEL,
+    "HIPPORAG_SEED_VECTOR_SEARCH": HIPPORAG_SEED_VECTOR_SEARCH,
+    "HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION": HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION,
+    "HIPPORAG_EPISODE_GROUNDING_EXPANSION": HIPPORAG_EPISODE_GROUNDING_EXPANSION,
 }
 
