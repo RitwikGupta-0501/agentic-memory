@@ -103,13 +103,31 @@ class SemanticMemoryManager:
 
     @staticmethod
     def _token_jaccard(a: str, b: str) -> float:
-        """Calculates token-level Jaccard similarity across punctuation/whitespace splits."""
-        set_a = set(re.split(r"[\s_\-]+", a.lower().strip()))
-        set_b = set(re.split(r"[\s_\-]+", b.lower().strip()))
-        if not set_a or not set_b:
+        """Calculates token-level Jaccard similarity with DevOps abbreviation expansion."""
+        abbr = {
+            "prod": "production",
+            "dev": "development",
+            "stg": "staging",
+            "stage": "staging",
+            "db": "database",
+            "k8s": "kubernetes",
+            "cfg": "config",
+            "conf": "config",
+            "auth": "authentication",
+            "gw": "gateway",
+            "msg": "message",
+            "srv": "service",
+            "svc": "service",
+            "pg": "postgresql",
+            "postgres": "postgresql",
+            "psql": "postgresql",
+        }
+        tokens_a = {abbr.get(w, w) for w in re.split(r"[\s_\-]+", a.lower().strip()) if w}
+        tokens_b = {abbr.get(w, w) for w in re.split(r"[\s_\-]+", b.lower().strip()) if w}
+        if not tokens_a or not tokens_b:
             return 0.0
-        intersection = len(set_a & set_b)
-        union = len(set_a | set_b)
+        intersection = len(tokens_a & tokens_b)
+        union = len(tokens_a | tokens_b)
         return intersection / union if union > 0 else 0.0
 
     def resolve_entity(
@@ -160,6 +178,16 @@ class SemanticMemoryManager:
             row = exact_match.result_set[0]
             matched_name = row[1]
             aliases = row[4] or []
+            if clean_name not in aliases:
+                now = time.time()
+                append_res = self.router.query(
+                    SEMANTIC_ENTITY_APPEND_ALIAS,
+                    {"canonical_name": matched_name, "raw_name": clean_name, "now": now},
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+                if append_res and append_res.result_set:
+                    aliases = append_res.result_set[0][1] or aliases
             return {
                 "raw_name": clean_name,
                 "canonical_name": matched_name,
@@ -205,26 +233,35 @@ class SemanticMemoryManager:
                 "aliases": updated_aliases,
             }
 
-        # Lexical Jaccard token overlap fallback (especially useful for mock provider)
-        all_entities = self.search_entities(tenant_id=tenant_id, query=clean_name, limit=10, user_id=user_id)
-        for ent in all_entities:
-            jaccard = self._token_jaccard(clean_name, ent["name"])
-            if jaccard >= 0.50:
-                now = time.time()
-                self.router.query(
-                    SEMANTIC_ENTITY_APPEND_ALIAS,
-                    {"canonical_name": ent["name"], "raw_name": clean_name, "now": now},
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                )
-                return {
-                    "raw_name": clean_name,
-                    "canonical_name": ent["name"],
-                    "resolved": True,
-                    "method": "lexical_jaccard",
-                    "similarity": round(jaccard, 4),
-                    "aliases": ent.get("aliases", []),
-                }
+        # Lexical Jaccard token overlap fallback across existing active entities
+        all_res = self.router.query(
+            "MATCH (e:Entity) RETURN e.name AS name, coalesce(e.aliases, []) AS aliases LIMIT 50",
+            {},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if all_res and all_res.result_set:
+            for row in all_res.result_set:
+                ent_name = row[0]
+                ent_aliases = row[1] or []
+                jaccard = self._token_jaccard(clean_name, ent_name)
+                if jaccard >= 0.50:
+                    now = time.time()
+                    append_res = self.router.query(
+                        SEMANTIC_ENTITY_APPEND_ALIAS,
+                        {"canonical_name": ent_name, "raw_name": clean_name, "now": now},
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                    )
+                    updated_aliases = append_res.result_set[0][1] if append_res and append_res.result_set else ent_aliases
+                    return {
+                        "raw_name": clean_name,
+                        "canonical_name": ent_name,
+                        "resolved": True,
+                        "method": "lexical_jaccard",
+                        "similarity": round(jaccard, 4),
+                        "aliases": updated_aliases,
+                    }
 
         # Novel entity (not found in graph)
         return {
@@ -235,6 +272,7 @@ class SemanticMemoryManager:
             "similarity": 0.0,
             "aliases": [clean_name],
         }
+
 
 
     def ensure_entity(
