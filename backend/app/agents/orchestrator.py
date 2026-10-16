@@ -128,19 +128,49 @@ class MultiAgentCoordinationEngine:
         }
         await asyncio.sleep(0.4)
 
-        # Context Agent inspects Semantic Knowledge Graph
-        triples = semantic_memory.extract_triples_from_text(user_prompt)
-        for tr in triples:
+        # Context Agent inspects Semantic Knowledge Graph with full ontological metadata
+        extracted_facts = semantic_memory.extract_facts(user_prompt)
+        extracted_seeds: List[str] = []
+        for tr in extracted_facts.triples:
+            extracted_seeds.extend([tr.subject, tr.object])
             semantic_memory.upsert_fact(
                 tenant_id=tenant_id,
                 subject=tr.subject,
                 predicate=tr.predicate,
                 new_object=tr.object,
                 episode_id=ep["id"],
+                confidence=tr.confidence,
+                cardinality=tr.cardinality,
+                subject_type=tr.subject_type or "Entity",
+                object_type=tr.object_type or "Entity",
                 user_id=user_id,
             )
 
-        # Pin context pointer
+        # Dual Cognitive Recall: Associative Semantic Recall (HippoRAG PPR)
+        unique_seeds = list(dict.fromkeys(extracted_seeds)) or None
+        hippo_res = semantic_memory.hipporag_retrieve(
+            tenant_id=tenant_id,
+            query=user_prompt,
+            seed_entities=unique_seeds,
+            top_k=3,
+            user_id=user_id,
+        )
+
+        yield {
+            "type": "hipporag_event",
+            "agent": "Context & Triage Agent",
+            "phase": "semantic_retrieval",
+            "message": f"HippoRAG associative recall identified {len(hippo_res.ranked_entities)} entity(ies) across {len(hippo_res.active_subgraph_edges)} active relations.",
+            "cypher": "CALL db.idx.vector.queryNodes('Entity'...) + Personalized PageRank + Bipartite Episode Grounding",
+            "seeds": hippo_res.seeds,
+            "ranked_entities": [e.model_dump() for e in hippo_res.ranked_entities[:3]],
+            "grounded_episodes": [ge.model_dump() for ge in hippo_res.ranked_episodes[:2]],
+            "active_edges_count": len(hippo_res.active_subgraph_edges),
+        }
+        await asyncio.sleep(0.4)
+
+        # Pin context pointers in Working Memory Blackboard
+        # 1. Pin source episode
         working_memory.pin_context(
             tenant_id=tenant_id,
             subtask_id=f"{task_id}_st1",
@@ -148,6 +178,27 @@ class MultiAgentCoordinationEngine:
             reason="Source user prompt and requirement context",
             user_id=user_id,
         )
+
+        # 2. Pin top retrieved entities
+        for top_ent in hippo_res.ranked_entities[:2]:
+            working_memory.pin_context(
+                tenant_id=tenant_id,
+                subtask_id=f"{task_id}_st1",
+                target_id=top_ent.name,
+                reason=f"HippoRAG associative entity (score: {top_ent.degree_normalized_score})",
+                user_id=user_id,
+            )
+
+        # 3. Pin top grounded episodes if different from source episode
+        for top_ge in hippo_res.ranked_episodes[:1]:
+            if top_ge.episode_id != ep["id"]:
+                working_memory.pin_context(
+                    tenant_id=tenant_id,
+                    subtask_id=f"{task_id}_st1",
+                    target_id=top_ge.episode_id,
+                    reason=f"HippoRAG grounded episode (score: {top_ge.grounded_score})",
+                    user_id=user_id,
+                )
 
         working_memory.complete_subtask(
             tenant_id=tenant_id,
@@ -162,7 +213,7 @@ class MultiAgentCoordinationEngine:
             "type": "agent_event",
             "agent": "Context & Triage Agent",
             "phase": "complete",
-            "message": "Completed triage. Attached [:PINNED_CONTEXT] pointer to Episode. Handoff to Executor Agent.",
+            "message": "Completed triage. Attached [:PINNED_CONTEXT] pointers to Episode and active Entity graph. Handoff to Executor Agent.",
             "cypher": "MERGE (st)-[:PINNED_CONTEXT]->(target); SET st.status = 'COMPLETED'",
         }
         await asyncio.sleep(0.5)
@@ -175,11 +226,13 @@ class MultiAgentCoordinationEngine:
             user_id=user_id,
         )
 
+        inherited_nodes = st2_claim.get("inherited_context", []) if st2_claim else []
         yield {
             "type": "agent_event",
             "agent": "Execution & Reflexion Agent",
             "phase": "claim",
-            "message": f"Atomically claimed SubTask 2: '{st2_claim['title'] if st2_claim else 'Execution'}'",
+            "message": f"Atomically claimed SubTask 2: '{st2_claim['title'] if st2_claim else 'Execution'}'. Inherited {len(inherited_nodes)} pinned context node(s) from SubTask 1.",
+            "inherited_context": inherited_nodes,
             "cypher": "MATCH (t:TaskRun)-[:HAS_SUBTASK]->(st:SubTask {status: 'PENDING'}) ...",
         }
         await asyncio.sleep(0.4)
