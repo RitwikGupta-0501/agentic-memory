@@ -17,6 +17,10 @@ from app.core.cypher_catalog import (
     SEMANTIC_ENTITY_FIND_BY_ALIAS,
     SEMANTIC_ENTITY_APPEND_ALIAS,
     SEMANTIC_ENTITY_VECTOR_SIMILARITY,
+    SEMANTIC_TIME_TRAVEL_SNAPSHOT,
+    SEMANTIC_ENTITY_EVOLUTION_TIMELINE,
+    SEMANTIC_TIME_TRAVEL_SUBGRAPH,
+    SEMANTIC_CYTOSCAPE_TIME_TRAVEL,
 )
 from app.core.falkor_client import falkor_router
 from app.core.embeddings.factory import embedding_service
@@ -343,9 +347,10 @@ class SemanticMemoryManager:
         object_type: str = "Entity",
         user_id: Optional[str] = None,
         resolve_entities: bool = True,
+        timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Executes bi-temporal invalidation and materializes bidirectional cross-layer provenance."""
-        now = time.time()
+        now = float(timestamp) if timestamp is not None else time.time()
         clean_subj = subject.strip()
         clean_pred = predicate.strip().upper()
         clean_obj = new_object.strip()
@@ -386,19 +391,187 @@ class SemanticMemoryManager:
         )
 
         invalidated_count = 0
+        valid_from = now
         if res and res.result_set:
             invalidated_count = res.result_set[0][0]
+            valid_from = float(res.result_set[0][4]) if res.result_set[0][4] is not None else now
 
         return {
             "subject": clean_subj,
             "predicate": clean_pred,
             "object": clean_obj,
-            "valid_from": now,
+            "valid_from": valid_from,
             "valid_to": None,
             "invalidated_count": invalidated_count,
             "source_episode": episode_id,
             "cardinality": card_str,
         }
+
+    def get_snapshot(
+        self,
+        tenant_id: str,
+        as_of: Optional[float] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Returns the full knowledge graph state active at timestamp as_of."""
+        target_t = float(as_of) if as_of is not None else time.time()
+        res = self.router.query(
+            SEMANTIC_TIME_TRAVEL_SNAPSHOT,
+            {"as_of": target_t},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        facts = []
+        if res and res.result_set:
+            for row in res.result_set:
+                facts.append({
+                    "subject": row[0],
+                    "subject_type": row[1],
+                    "predicate": row[2],
+                    "cardinality": row[3],
+                    "confidence": float(row[4]),
+                    "valid_from": float(row[5]),
+                    "valid_to": float(row[6]) if row[6] is not None else None,
+                    "source_episode": row[7],
+                    "object": row[8],
+                    "object_type": row[9],
+                })
+        return facts
+
+    def get_entity_history(
+        self,
+        tenant_id: str,
+        entity_name: str,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Returns the full chronological evolution of all relationships an entity participated in."""
+        clean_name = self.resolve_entity(tenant_id, entity_name, user_id=user_id)
+        slug = self.slugify(clean_name)
+        res = self.router.query(
+            SEMANTIC_ENTITY_EVOLUTION_TIMELINE,
+            {"entity_name": clean_name, "slug": slug},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        timeline = []
+        active_count = 0
+        superseded_count = 0
+        if res and res.result_set:
+            for row in res.result_set:
+                status = row[9]
+                if status == "ACTIVE":
+                    active_count += 1
+                else:
+                    superseded_count += 1
+                timeline.append({
+                    "subject": row[0],
+                    "predicate": row[1],
+                    "object": row[2],
+                    "cardinality": row[3],
+                    "confidence": float(row[4]),
+                    "valid_from": float(row[5]),
+                    "valid_to": float(row[6]) if row[6] is not None else None,
+                    "source_episode": row[7],
+                    "invalidated_by_episode": row[8],
+                    "status": status,
+                })
+        return {
+            "entity_name": clean_name,
+            "total_transitions": len(timeline),
+            "active_facts_count": active_count,
+            "superseded_facts_count": superseded_count,
+            "timeline": timeline,
+        }
+
+    def get_time_travel_subgraph(
+        self,
+        tenant_id: str,
+        seed_entity: str,
+        as_of: Optional[float] = None,
+        depth: int = 1,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Returns point-in-time neighborhood view around a seed entity."""
+        target_t = float(as_of) if as_of is not None else time.time()
+        clean_name = self.resolve_entity(tenant_id, seed_entity, user_id=user_id)
+        slug = self.slugify(clean_name)
+        res = self.router.query(
+            SEMANTIC_TIME_TRAVEL_SUBGRAPH,
+            {"seed_name": clean_name, "slug": slug, "as_of": target_t},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if res and res.result_set:
+            row = res.result_set[0]
+            raw_rels = row[2] or []
+            clean_rels = [r for r in raw_rels if r and r.get("target") is not None]
+            raw_neighbors = row[3] or []
+            clean_neighbors = [n for n in raw_neighbors if n is not None]
+            return {
+                "seed": row[0],
+                "seed_type": row[1],
+                "as_of": target_t,
+                "relationships": clean_rels,
+                "neighbors": clean_neighbors,
+            }
+        return {
+            "seed": clean_name,
+            "seed_type": "Concept",
+            "as_of": target_t,
+            "relationships": [],
+            "neighbors": [],
+        }
+
+    def get_cytoscape_elements_as_of(
+        self,
+        tenant_id: str,
+        as_of: Optional[float] = None,
+        include_invalidated: bool = True,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Converts FalkorDB query results into Cytoscape.js format with visual dual-edge styling."""
+        target_t = float(as_of) if as_of is not None else time.time()
+        res = self.router.query(
+            SEMANTIC_CYTOSCAPE_TIME_TRAVEL,
+            {"as_of": target_t, "include_invalidated": include_invalidated},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        elements: Dict[str, List[Dict[str, Any]]] = {"nodes": [], "edges": []}
+        if res and res.result_set:
+            raw_nodes, raw_edges = res.result_set[0]
+            for n in raw_nodes or []:
+                if n and n.get("name"):
+                    elements["nodes"].append({
+                        "data": {
+                            "id": n["name"],
+                            "label": n["name"],
+                            "canonical_name": n.get("canonical_name", ""),
+                            "type": n.get("type", "Concept"),
+                            "created_at": n.get("created_at"),
+                        }
+                    })
+            for e in raw_edges or []:
+                if e and e.get("target") is not None:
+                    is_active = e.get("status") == "ACTIVE"
+                    elements["edges"].append({
+                        "data": {
+                            "id": f"e_{e['source']}_{e['predicate']}_{e['target']}_{int(e.get('valid_from', 0))}",
+                            "source": e["source"],
+                            "target": e["target"],
+                            "label": e["predicate"],
+                            "cardinality": e.get("cardinality", "SINGLE"),
+                            "valid_from": e.get("valid_from"),
+                            "valid_to": e.get("valid_to"),
+                            "status": e.get("status"),
+                            "line_style": "solid" if is_active else "dashed",
+                            "color": "#10b981" if is_active else "#ef4444",
+                        }
+                    })
+        return elements
+
+
+
 
     def search_entities(
         self,
