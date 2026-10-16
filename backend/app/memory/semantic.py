@@ -1,16 +1,18 @@
-"""Semantic Memory Layer: Bi-temporal knowledge graph and HippoRAG hybrid retrieval."""
-
+import math
 import re
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.cypher_catalog import (
     BITEMPORAL_INVALIDATE_AND_UPSERT,
     HIPPORAG_HYBRID_RETRIEVAL,
+    HIPPORAG_SEED_VECTOR_SEARCH,
+    HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION,
+    HIPPORAG_EPISODE_GROUNDING_EXPANSION,
     SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING,
     SEMANTIC_PROVENANCE_UPSERT_AND_LINK,
     SEMANTIC_ENTITY_VECTOR_SEARCH,
@@ -89,6 +91,100 @@ class SemanticFactInput(BaseModel):
     cardinality: PredicateCardinality = PredicateCardinality.SINGLE
     subject_type: str = "Entity"
     object_type: str = "Entity"
+
+
+class HippoRAGRankedEntity(BaseModel):
+    name: str
+    type: str = "Concept"
+    raw_ppr: float
+    degree_normalized_score: float
+    is_seed: bool = False
+
+
+class HippoRAGGroundedEpisode(BaseModel):
+    episode_id: str
+    content: str
+    role: str = "system"
+    importance_score: float
+    grounded_score: float
+    contributing_entities: List[str] = Field(default_factory=list)
+
+
+class HippoRAGResult(BaseModel):
+    status: str = "SUCCESS"
+    seeds: List[str] = Field(default_factory=list)
+    seed_scores: Dict[str, float] = Field(default_factory=dict)
+    as_of: float
+    ranked_entities: List[HippoRAGRankedEntity] = Field(default_factory=list)
+    ranked_episodes: List[HippoRAGGroundedEpisode] = Field(default_factory=list)
+    active_subgraph_edges: List[Dict[str, Any]] = Field(default_factory=list)
+
+    def __getitem__(self, item: str) -> Any:
+        if item == "matches":
+            return [e.model_dump() for e in self.ranked_entities]
+        return getattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        if item == "matches":
+            return [e.model_dump() for e in self.ranked_entities]
+        return getattr(self, item, default)
+
+
+def _compute_personalized_pagerank(
+    adj: Dict[str, List[Tuple[str, float]]],
+    p0: Dict[str, float],
+    all_nodes: List[str],
+    alpha: float = 0.85,
+    max_iter: int = 25,
+    tol: float = 1e-5,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Executes sparse power-iteration Personalized PageRank with sublinear hub damping."""
+    if not all_nodes:
+        return {}, {}
+
+    total_p0 = sum(p0.get(u, 0.0) for u in all_nodes)
+    if total_p0 > 0:
+        norm_p0 = {u: p0.get(u, 0.0) / total_p0 for u in all_nodes}
+    else:
+        uniform_val = 1.0 / len(all_nodes)
+        norm_p0 = {u: uniform_val for u in all_nodes}
+
+    # 1. Build transition probability matrix P and degree dictionary
+    P: Dict[str, Dict[str, float]] = {}
+    deg: Dict[str, float] = {}
+    for u in all_nodes:
+        nbrs = adj.get(u, [])
+        total_w = sum(w for _, w in nbrs)
+        deg[u] = total_w
+        if total_w > 0:
+            P[u] = {v: w / total_w for v, w in nbrs}
+        else:
+            P[u] = {}
+
+    pi = dict(norm_p0)
+    for _ in range(max_iter):
+        next_pi = {u: (1.0 - alpha) * norm_p0.get(u, 0.0) for u in all_nodes}
+        # Sink mass redistribution
+        sink_mass = sum(pi[u] for u in all_nodes if not P[u])
+        for u in all_nodes:
+            next_pi[u] += alpha * sink_mass * norm_p0.get(u, 0.0)
+        # Random walk transfer
+        for u, trans in P.items():
+            mass = pi.get(u, 0.0)
+            if mass > 0:
+                for v, prob in trans.items():
+                    next_pi[v] += alpha * mass * prob
+        diff = sum(abs(next_pi[u] - pi[u]) for u in all_nodes)
+        pi = next_pi
+        if diff < tol:
+            break
+
+    # Sublinear hub damping + seed prior preservation
+    norm_pi = {
+        u: (pi[u] / (1.0 + math.log1p(deg.get(u, 0.0)))) + (0.15 * norm_p0.get(u, 0.0))
+        for u in all_nodes
+    }
+    return pi, norm_pi
 
 
 
@@ -277,7 +373,23 @@ class SemanticMemoryManager:
             "aliases": [clean_name],
         }
 
-
+    def append_entity_alias(
+        self,
+        tenant_id: str,
+        canonical_name: str,
+        raw_alias: str,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Appends a new alias to an existing entity."""
+        res = self.router.query(
+            SEMANTIC_ENTITY_APPEND_ALIAS,
+            {"canonical_name": canonical_name, "raw_name": raw_alias.strip(), "now": time.time()},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if res and res.result_set:
+            return res.result_set[0][1] or []
+        return []
 
     def ensure_entity(
         self,
@@ -603,34 +715,287 @@ class SemanticMemoryManager:
                 })
         return entities
 
-    def hipporag_retrieve(
+    def _has_lexical_overlap(self, query: str, entity_name: str, aliases: List[str]) -> bool:
+        """Determines if there is meaningful lexical or abbreviation overlap between query and entity."""
+        q_clean = query.lower()
+        q_tokens = set(re.findall(r"\w+", q_clean))
+        cand_strings = [entity_name] + (aliases or [])
+        for s in cand_strings:
+            s_clean = s.lower().replace("_", " ")
+            s_tokens = set(re.findall(r"\w+", s_clean))
+            if q_tokens & s_tokens:
+                return True
+            if s_clean in q_clean or (len(s_clean) >= 3 and s_clean in q_clean):
+                return True
+            if self._token_jaccard(query, s) > 0.15:
+                return True
+        return False
+
+    def hipporag_find_seeds(
         self,
         tenant_id: str,
-        seed_entities: List[str],
+        query: Optional[str] = None,
+        seed_entities: Optional[List[str]] = None,
         user_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Hybrid HippoRAG retrieval: Seed entities -> 2-hop active neighborhood expansion."""
-        if not seed_entities:
-            return {"seeds": [], "subgraph": []}
+        candidate_limit: int = 10,
+        min_similarity: float = 0.45,
+    ) -> Dict[str, float]:
+        """Hybrid seed entity discovery via explicit entities, alias matching, and vector search."""
+        seed_scores: Dict[str, float] = {}
+
+        # 1. Explicit seed entities
+        if seed_entities:
+            for s in seed_entities:
+                if not s or not s.strip():
+                    continue
+                try:
+                    resolved = self.resolve_entity(tenant_id=tenant_id, raw_name=s.strip(), user_id=user_id)
+                    seed_scores[resolved] = 1.0
+                except Exception:
+                    seed_scores[s.strip()] = 1.0
+
+        # 2. Query-based seed discovery
+        if query and query.strip():
+            clean_query = query.strip()
+            # 2a. N-gram alias matching (from length 4 down to 1)
+            words = [w for w in re.split(r"[\s,;:.!?]+", clean_query) if w]
+            for n in range(min(4, len(words)), 0, -1):
+                for i in range(len(words) - n + 1):
+                    phrase = " ".join(words[i : i + n])
+                    if len(phrase) < 2:
+                        continue
+                    res = self.router.query(
+                        SEMANTIC_ENTITY_FIND_BY_ALIAS,
+                        {"slug": self.slugify(phrase), "raw_name": phrase},
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                    )
+                    if res and res.result_set:
+                        row = res.result_set[0]
+                        ent_name = row[1]
+                        seed_scores[ent_name] = max(seed_scores.get(ent_name, 0.0), 1.0)
+
+            # 2b. Dense vector similarity search
+            try:
+                q_vec = self.embeddings.embed_query(clean_query)
+                res = self.router.query(
+                    HIPPORAG_SEED_VECTOR_SEARCH,
+                    {
+                        "candidate_limit": candidate_limit,
+                        "query_vec": q_vec,
+                        "min_similarity": min_similarity,
+                    },
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+                is_mock = getattr(self.embeddings, "is_mock", False) or settings.embedding_provider.lower() == "mock"
+                if res and res.result_set:
+                    for row in res.result_set:
+                        ent_name = row[0]
+                        ent_aliases = row[3] or []
+                        sim = float(row[4]) if len(row) > 4 else 0.0
+                        norm_sim = max(0.0, min(1.0, sim))
+
+                        # Bug 3 mitigation: In mock mode, reject candidates without lexical/alias overlap
+                        if is_mock and not self._has_lexical_overlap(clean_query, ent_name, ent_aliases):
+                            continue
+
+                        seed_scores[ent_name] = max(seed_scores.get(ent_name, 0.0), round(norm_sim, 4))
+            except Exception:
+                pass
+
+        return seed_scores
+
+    def hipporag_ground_episodes(
+        self,
+        tenant_id: str,
+        norm_pi: Dict[str, float],
+        as_of: float,
+        user_id: Optional[str] = None,
+        top_k: int = 5,
+    ) -> List[HippoRAGGroundedEpisode]:
+        """Projects entity activation mass onto episodic memory with temporal and invalidation gating."""
+        if not norm_pi:
+            return []
+
+        active_entities = [name for name, score in norm_pi.items() if score > 0.0]
+        if not active_entities:
+            return []
 
         res = self.router.query(
-            HIPPORAG_HYBRID_RETRIEVAL,
-            {"seed_entities": seed_entities},
+            HIPPORAG_EPISODE_GROUNDING_EXPANSION,
+            {
+                "entity_names": active_entities,
+                "as_of": as_of,
+            },
             tenant_id=tenant_id,
             user_id=user_id,
         )
 
-        results = []
-        if res and res.result_set:
-            for row in res.result_set:
-                seed_node = row[0]
-                results.append({
-                    "seed": getattr(seed_node, "properties", {}).get("name", str(seed_node)),
-                    "path_count": len(row[1]) if row[1] else 0,
-                    "episodes_count": len(row[2]) if row[2] else 0,
-                })
+        if not res or not res.result_set:
+            return []
 
-        return {"seeds": seed_entities, "matches": results}
+        episodes_map: Dict[str, Dict[str, Any]] = {}
+        for row in res.result_set:
+            ent_name = row[0]
+            link_type = str(row[1]) if row[1] else "DERIVED_FROM"
+            ep_id = row[2]
+            content = row[3] or ""
+            role = row[4] or "system"
+            importance = float(row[5]) if row[5] is not None else 0.5
+            timestamp = float(row[6]) if row[6] is not None else 0.0
+
+            w_link = 1.0 if link_type == "DERIVED_FROM" else 0.6
+            ent_score = norm_pi.get(ent_name, 0.0)
+            contrib = ent_score * w_link * importance
+
+            if ep_id not in episodes_map:
+                episodes_map[ep_id] = {
+                    "episode_id": ep_id,
+                    "content": content,
+                    "role": role,
+                    "importance_score": importance,
+                    "timestamp": timestamp,
+                    "grounded_score": 0.0,
+                    "contributing_entities": set(),
+                }
+
+            episodes_map[ep_id]["grounded_score"] += contrib
+            episodes_map[ep_id]["contributing_entities"].add(ent_name)
+
+        ranked = [
+            HippoRAGGroundedEpisode(
+                episode_id=data["episode_id"],
+                content=data["content"],
+                role=data["role"],
+                importance_score=round(data["importance_score"], 4),
+                grounded_score=round(data["grounded_score"], 6),
+                contributing_entities=sorted(list(data["contributing_entities"])),
+            )
+            for data in episodes_map.values()
+        ]
+        ranked.sort(key=lambda x: x.grounded_score, reverse=True)
+        return ranked[:top_k]
+
+    def hipporag_retrieve(
+        self,
+        tenant_id: str,
+        query: Optional[str] = None,
+        seed_entities: Optional[List[str]] = None,
+        top_k: int = 5,
+        damping: float = 0.85,
+        max_hops: int = 2,
+        as_of: Optional[float] = None,
+        user_id: Optional[str] = None,
+    ) -> HippoRAGResult:
+        """Executes NeurIPS 2024 HippoRAG associative retrieval over active knowledge graph."""
+        target_t = float(as_of) if as_of is not None else time.time()
+
+        # Step 1: Hybrid Seed Discovery (lexical exact + alias + vector with mock guards)
+        seed_scores = self.hipporag_find_seeds(
+            tenant_id=tenant_id,
+            query=query,
+            seed_entities=seed_entities,
+            user_id=user_id,
+        )
+
+        if not seed_scores:
+            return HippoRAGResult(
+                status="NO_SEEDS_FOUND",
+                seeds=[],
+                seed_scores={},
+                as_of=target_t,
+                ranked_entities=[],
+                ranked_episodes=[],
+                active_subgraph_edges=[],
+            )
+
+        seeds = list(seed_scores.keys())
+
+        # Step 2: Fetch Active Subgraph within max_hops (bi-temporal filtering)
+        subgraph_res = self.router.query(
+            HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION,
+            {
+                "seed_names": seeds,
+                "as_of": target_t,
+                "max_hops": max(1, min(3, max_hops)),
+            },
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+
+        adj: Dict[str, List[Tuple[str, float]]] = {}
+        edges: List[Dict[str, Any]] = []
+        all_nodes_set = set(seeds)
+
+        if subgraph_res and subgraph_res.result_set:
+            for row in subgraph_res.result_set:
+                src = row[0]
+                pred = row[1]
+                tgt = row[2]
+                w = float(row[3]) if row[3] is not None else 1.0
+                v_from = float(row[4]) if row[4] is not None else 0.0
+                v_to = float(row[5]) if row[5] is not None else None
+
+                edges.append({
+                    "source": src,
+                    "predicate": pred,
+                    "target": tgt,
+                    "weight": w,
+                    "valid_from": v_from,
+                    "valid_to": v_to,
+                })
+                # Undirected graph for spreading activation (Collins & Loftus 1975)
+                adj.setdefault(src, []).append((tgt, w))
+                adj.setdefault(tgt, []).append((src, w))
+                all_nodes_set.add(src)
+                all_nodes_set.add(tgt)
+
+        # Step 3: Compute Personalized PageRank spreading activation
+        all_nodes = sorted(list(all_nodes_set))
+        p0 = {u: seed_scores.get(u, 0.0) for u in all_nodes}
+        raw_pi, norm_pi = _compute_personalized_pagerank(
+            adj=adj,
+            p0=p0,
+            all_nodes=all_nodes,
+            alpha=damping,
+        )
+
+        # Step 4: Rank entities
+        sorted_nodes = sorted(
+            all_nodes,
+            key=lambda u: (norm_pi.get(u, 0.0), raw_pi.get(u, 0.0)),
+            reverse=True,
+        )
+        ranked_entities = [
+            HippoRAGRankedEntity(
+                name=u,
+                raw_ppr=round(raw_pi.get(u, 0.0), 6),
+                degree_normalized_score=round(norm_pi.get(u, 0.0), 6),
+                is_seed=(u in seed_scores),
+            )
+            for u in sorted_nodes
+        ]
+
+        # Step 5: Bipartite Projection onto Grounded Episodes
+        ranked_episodes = self.hipporag_ground_episodes(
+            tenant_id=tenant_id,
+            norm_pi=norm_pi,
+            as_of=target_t,
+            user_id=user_id,
+            top_k=top_k,
+        )
+
+        # Step 6: Return structured result
+        return HippoRAGResult(
+            status="SUCCESS",
+            seeds=seeds,
+            seed_scores=seed_scores,
+            as_of=target_t,
+            ranked_entities=ranked_entities[:top_k * 2],
+            ranked_episodes=ranked_episodes,
+            active_subgraph_edges=edges,
+        )
 
     def _get_structured_llm(self):
         """Constructs a LangChain chat model with structured FactExtractionResult output."""

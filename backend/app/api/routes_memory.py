@@ -33,7 +33,13 @@ class FactUpsertRequest(BaseModel):
 
 class HippoRAGRequest(BaseModel):
     tenant_id: Optional[str] = None
-    seed_entities: List[str]
+    seed_entities: Optional[List[str]] = None
+    query: Optional[str] = None
+    top_k: int = Field(default=5, ge=1, le=50)
+    damping: float = Field(default=0.85, ge=0.1, le=0.99)
+    max_hops: int = Field(default=2, ge=1, le=3)
+    as_of: Optional[float] = None
+    user_id: Optional[str] = None
 
 
 class EpisodeCreateRequest(BaseModel):
@@ -217,10 +223,27 @@ def upsert_semantic_fact(req: FactUpsertRequest) -> Dict[str, Any]:
 
 
 @router.post("/hipporag")
+@router.post("/semantic/hipporag")
 def hipporag_retrieval(req: HippoRAGRequest) -> Dict[str, Any]:
-    """Runs HippoRAG hybrid retrieval."""
+    """Executes HippoRAG neurobiologically-inspired associative recall."""
     t_id = req.tenant_id or settings.default_tenant_id
-    return semantic_memory.hipporag_retrieve(tenant_id=t_id, seed_entities=req.seed_entities)
+    result = semantic_memory.hipporag_retrieve(
+        tenant_id=t_id,
+        query=req.query,
+        seed_entities=req.seed_entities,
+        top_k=req.top_k,
+        damping=req.damping,
+        max_hops=req.max_hops,
+        as_of=req.as_of,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": result.status,
+        "result": result.model_dump(),
+        "seeds": result.seeds,
+        "matches": [e.model_dump() for e in result.ranked_entities],
+    }
 
 
 @router.get("/embedding-status")
