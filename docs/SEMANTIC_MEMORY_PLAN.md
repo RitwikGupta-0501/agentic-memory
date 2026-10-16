@@ -665,7 +665,9 @@ collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
 
 ---
 
-### Phase 4: HippoRAG Personalized PageRank (PPR) Associative Recall
+### Phase 4: HippoRAG Personalized PageRank (PPR) Associative Recall `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Delivered via `feat/semantic-phase4-hipporag-associative-recall` — 76/76 Unit & Integration Tests Passing, sparse Personalized PageRank spreading activation with sublinear hub damping and seed prior preservation, dynamic $K$-hop active subgraph expansion, invalidation-gated cross-layer episodic grounding, time-travel associative recall, and REST endpoints)
 
 #### Objective
 Implement the formal NeurIPS 2024 HippoRAG associative retrieval algorithm natively over FalkorDB's active knowledge graph, computing stationary probability distributions via Personalized PageRank to rank connected entities and source episodes.
@@ -675,92 +677,103 @@ Implement the formal NeurIPS 2024 HippoRAG associative retrieval algorithm nativ
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Agent as Autonomous Agent
-    participant Hippo as HippoRAG Engine
+    participant Agent as Autonomous Agent / User
+    participant Hippo as HippoRAG Engine (semantic.py)
     participant Falkor as FalkorDB Engine
 
-    Agent->>Hippo: retrieve(query="cutover failure on primary database", top_k=5)
-    Hippo->>Hippo: 1. Extract Seed Entity Mentions & Embed Query
-    Hippo->>Falkor: HIPPORAG_SEED_MATCH (query_vec, candidate_names)
-    Falkor-->>Hippo: Seed Entities S = ['Prod_DB', 'Database_Migration']
-    Hippo->>Falkor: HIPPORAG_PPR_ACTIVE_WALK (seed_names, damping=0.85, max_depth=2)
-    Note over Falkor: Random walk with restarts over active edges (valid_to IS NULL)<br/>Calculates stationary probability p* for all 1..2 hop neighbors<br/>Aggregates grounded episode IDs via [:DERIVED_FROM]
-    Falkor-->>Hippo: Ranked Entities + Activation Mass + Grounded Episodes
-    Hippo->>Hippo: 2. Compute Episode Activation Scores: sum(p*(v) * confidence)
-    Hippo-->>Agent: Structured HippoRAGResult (Ranked Entities, Subgraph, Top Episodes)
+    Agent->>Hippo: retrieve(query="Check database latency on primary DB", top_k=5)
+    Hippo->>Falkor: 1. Hybrid Seed Discovery (alias match & HIPPORAG_SEED_VECTOR_SEARCH)
+    Falkor-->>Hippo: Seed Entities S = ['Prod_DB'] with initial priors p0
+    Hippo->>Falkor: 2. HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION (seed_names, as_of, max_hops=2)
+    Falkor-->>Hippo: Active bi-temporal subgraph edges (valid_from <= as_of < valid_to)
+    Hippo->>Hippo: 3. Sparse Power Iteration: pi = alpha P^T pi + (1-alpha) p0 + sink teleportation
+    Hippo->>Hippo: 4. Sublinear Hub Damping: pi_norm = pi / (1 + ln(1 + D)) + 0.15 * p0
+    Hippo->>Falkor: 5. HIPPORAG_EPISODE_GROUNDING_EXPANSION (active_entities, as_of)
+    Note over Falkor: Bipartite traversal over [:DERIVED_FROM] & [:MENTIONED_IN]<br/>Filters ep.timestamp <= as_of<br/>Excludes episodes whose facts were superseded (invalidated_count = 0)
+    Falkor-->>Hippo: Active grounded episodes & importance scores
+    Hippo->>Hippo: 6. Score(Ep) = sum(pi_norm(e) * w_link * Importance(Ep))
+    Hippo-->>Agent: Structured HippoRAGResult (Ranked Entities, Ranked Episodes, Subgraph)
 ```
 
 #### Production Cypher Queries (`cypher_catalog.py`)
 
 ```cypher
-// HIPPORAG_SEED_MATCH
-MATCH (e:Entity)
-WHERE e.name IN $candidate_names OR e.canonical_name IN $candidate_names
-RETURN e.name AS name, 1.0 AS score
-UNION
-CALL db.idx.vector.queryNodes('Entity', 'embedding', $seed_limit, vecf32($query_vec))
+// HIPPORAG_SEED_VECTOR_SEARCH
+CALL db.idx.vector.queryNodes('Entity', 'embedding', $candidate_limit, vecf32($query_vec))
 YIELD node AS e, score
-WHERE (1.0 - score) >= 0.75
-RETURN e.name AS name, (1.0 - score) AS score
-ORDER BY score DESC LIMIT $seed_limit
+WITH e, (1.0 - score) AS similarity
+WHERE similarity >= $min_similarity
+RETURN e.name AS name,
+       e.canonical_name AS canonical_name,
+       e.type AS type,
+       coalesce(e.aliases, []) AS aliases,
+       similarity
+ORDER BY similarity DESC
 ```
 
 ```cypher
-// HIPPORAG_PPR_ACTIVE_WALK
+// HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION
 MATCH (seed:Entity)
-WHERE seed.name IN $seed_names
-MATCH path = (seed)-[r:RELATES_TO*1..2]-(neighbor:Entity)
-WHERE all(edge IN relationships(path) WHERE edge.valid_to IS NULL)
-WITH seed, neighbor,
-     reduce(w = 1.0, edge IN relationships(path) | w * coalesce(edge.confidence, 1.0)) AS path_weight,
-     length(path) AS depth
-WITH neighbor, sum(path_weight * ($damping / depth)) AS ppr_activation
-ORDER BY ppr_activation DESC LIMIT $top_entities
-OPTIONAL MATCH (neighbor)-[:DERIVED_FROM]->(ep:Episode)
-RETURN neighbor.name AS entity_name,
-       neighbor.type AS entity_type,
-       round(ppr_activation * 1000.0) / 1000.0 AS activation_score,
-       collect(DISTINCT ep.id) AS grounded_episodes
+WHERE (seed.name IN $seed_names OR seed.canonical_name IN $seed_names)
+  AND coalesce(seed.created_at, 0.0) <= $as_of
+MATCH path = (seed)-[r:RELATES_TO*1..3]-(target:Entity)
+WHERE length(path) <= $max_hops
+  AND all(node IN nodes(path) WHERE coalesce(node.created_at, 0.0) <= $as_of)
+  AND all(edge IN relationships(path) WHERE 
+      edge.valid_from <= $as_of 
+      AND (edge.valid_to IS NULL OR edge.valid_to > $as_of)
+  )
+UNWIND relationships(path) AS edge
+RETURN DISTINCT startNode(edge).name AS source,
+       edge.predicate AS predicate,
+       endNode(edge).name AS target,
+       coalesce(edge.confidence, 1.0) AS weight,
+       edge.valid_from AS valid_from,
+       edge.valid_to AS valid_to
 ```
 
-#### Python HippoRAG Aggregation Engine (`semantic.py`)
-```python
-class HippoRAGResult(BaseModel):
-    seeds: List[str]
-    ranked_entities: List[Dict[str, Any]]
-    ranked_episodes: List[Dict[str, Any]]
-    active_subgraph_edges: List[Dict[str, Any]]
-
-def hipporag_retrieve(
-    self,
-    tenant_id: str,
-    query: str,
-    top_k: int = 5,
-    damping: float = 0.85,
-    user_id: Optional[str] = None,
-) -> HippoRAGResult:
-    # 1. Resolve Seeds
-    # 2. Run HIPPORAG_PPR_ACTIVE_WALK
-    # 3. Aggregate episode activation mass
-    # 4. Return top_k ranked entities and episodes
+```cypher
+// HIPPORAG_EPISODE_GROUNDING_EXPANSION
+MATCH (e:Entity)
+WHERE e.name IN $entity_names
+MATCH (e)-[r:DERIVED_FROM|MENTIONED_IN]->(ep:Episode)
+WHERE coalesce(ep.archived, false) = false
+  AND coalesce(ep.timestamp, r.timestamp, 0.0) <= $as_of
+OPTIONAL MATCH (s:Entity)-[old_rel:RELATES_TO {source_episode: ep.id}]->(t:Entity)
+WHERE old_rel.valid_to IS NOT NULL AND old_rel.valid_to <= $as_of
+WITH e, r, ep, count(old_rel) AS invalidated_count
+WHERE invalidated_count = 0
+RETURN e.name AS entity,
+       type(r) AS link_type,
+       ep.id AS episode_id,
+       coalesce(ep.content, '') AS content,
+       coalesce(ep.role, 'system') AS role,
+       coalesce(ep.utility_score, ep.importance_score, 0.5) AS importance_score,
+       coalesce(ep.timestamp, 0.0) AS timestamp
 ```
 
-#### Falsifiable Requirements
+#### Execution Roadmap & Atomic Commits
 
-1. **R4.1 - Multi-Hop Associative Coverage**:
-   - *Current:* Flat 2-hop collection with no ranking.
-   - *Target:* PPR calculation distributes activation mass across multi-hop neighbors, scoring 1-hop neighbors higher than 2-hop neighbors according to the damping factor $d = 0.85$.
-   - *Acceptance:* Unit test in `test_hipporag_associative_retrieval.py` confirms mathematical ordering $PPR(\text{1-hop}) > PPR(\text{2-hop})$.
+- **Commit 1:** `feat(cypher): add HippoRAG seed vector match, dynamic hop active subgraph, and temporally-filtered episode grounding queries`
+- **Commit 2:** `feat(semantic): define HippoRAG Pydantic schemas with dict subscript compatibility and sparse Personalized PageRank algorithm`
+- **Commit 3:** `feat(semantic): implement hybrid seed entity linking with lexical alias check and mock vector guards`
+- **Commit 4:** `feat(semantic): implement cross-layer bipartite episode grounding with invalidation and temporal filtering`
+- **Commit 5:** `feat(semantic): implement unified hipporag_retrieve with time-travel and zero-seed fallback`
+- **Commit 6:** `feat(api): expose query-driven HippoRAG endpoints in routes_memory.py with backward compatibility`
+- **Commit 7:** `test(semantic): add comprehensive HippoRAG test suite in test_hipporag_associative_retrieval.py`
+- **Commit 8:** `docs: record Semantic Memory Phase 4 completion in master tracking plan`
 
-2. **R4.2 - Stale Fact Pruning during Walk**:
-   - *Current:* Unchecked path expansion traverses superseded facts.
-   - *Target:* The PPR random walk strictly filters `WHERE all(edge IN relationships(path) WHERE edge.valid_to IS NULL)`.
-   - *Acceptance:* Unit test asserting that superseded entity `PostgreSQL` receives $0.0$ activation mass when querying for active database components.
+#### Falsifiable Verification Matrix (`test_hipporag_associative_retrieval.py`)
 
-3. **R4.3 - Episode Grounding Convergence**:
-   - *Current:* No episode ranking from entity graph.
-   - *Target:* Source episodes are ranked by cumulative grounded entity activation.
-   - *Acceptance:* Unit test asserting that `ep_init_3` (which introduced `FalkorDB`) ranks #1 when querying about active graph memory.
+| Test Identifier | Category | Scenario & Invariants | Result |
+| :--- | :--- | :--- | :--- |
+| **TEST-HIPPORAG-01** | **Mathematical Proximity Decay** | Star/chain graph: `Prod_DB` (Seed) $\to$ `FalkorDB` (1-hop) $\to$ `Redis_Engine` (2-hop), plus `Prod_DB` $\to$ `Prometheus` (1-hop). Strictly verifies $\tilde{\pi}(\text{Prod\_DB}) > \tilde{\pi}(\text{FalkorDB}) > \tilde{\pi}(\text{Redis\_Engine}) > 0$. Multi-edge seed is never penalized below downstream nodes. | ✅ **PASS** |
+| **TEST-HIPPORAG-02** | **Stale Fact Pruning (Temporal Gating)** | `Prod_DB` migrated from `PostgreSQL` to `FalkorDB`. Query at $t=2500.0$: Active node `FalkorDB` receives positive mass; superseded node `PostgreSQL` is strictly excluded from active subgraph. | ✅ **PASS** |
+| **TEST-HIPPORAG-03** | **Bipartite Episode Grounding Convergence** | Two episodes: `ep_1` (created `PostgreSQL`, superseded at $t=2000.0$) and `ep_2` (created `FalkorDB`, active at $t=2000.0$). Query at $t=2500.0$: `ep_2` is ranked #1. Obsolete `ep_1` receives 0 grounding score due to invalidation filter. | ✅ **PASS** |
+| **TEST-HIPPORAG-04** | **Hybrid Natural Language Seed Discovery** | Query: *"Check database latency on primary DB"*. Graph contains entity `Prod_DB` with alias `"primary db"`. Automatic alias resolution identifies `Prod_DB` as seed; activation spreads through its active neighbors. | ✅ **PASS** |
+| **TEST-HIPPORAG-05** | **Time-Travel Associative Recall** | Migration occurred at $t=2000.0$. At $\tau_1 = 1500.0$: `PostgreSQL` and `ep_1` are retrieved; future `ep_2` never leaks. At $\tau_2 = 2500.0$: `FalkorDB` and `ep_2` are retrieved; `ep_1` is pruned. | ✅ **PASS** |
+| **TEST-HIPPORAG-06** | **Cold-Start / Zero-Seed Fallback** | Query with completely disjoint technical domain (`"quantum teleportation entanglement"`). Returns `status="NO_SEEDS_FOUND"` cleanly without false positives, unhandled exceptions, or `ZeroDivisionError`. | ✅ **PASS** |
+| **TEST-HIPPORAG-07** | **REST API Endpoints & Backward Compatibility** | Validates HTTP 200 responses across primary (`POST /api/v1/memory/semantic/hipporag`) and legacy (`POST /api/v1/memory/hipporag`) endpoints with full dictionary subscript compatibility. | ✅ **PASS** |
 
 ---
 
