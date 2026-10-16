@@ -699,6 +699,97 @@ class SemanticMemoryManager:
                 })
         return entities
 
+    def _has_lexical_overlap(self, query: str, entity_name: str, aliases: List[str]) -> bool:
+        """Determines if there is meaningful lexical or abbreviation overlap between query and entity."""
+        q_clean = query.lower()
+        q_tokens = set(re.findall(r"\w+", q_clean))
+        cand_strings = [entity_name] + (aliases or [])
+        for s in cand_strings:
+            s_clean = s.lower().replace("_", " ")
+            s_tokens = set(re.findall(r"\w+", s_clean))
+            if q_tokens & s_tokens:
+                return True
+            if s_clean in q_clean or (len(s_clean) >= 3 and s_clean in q_clean):
+                return True
+            if self._token_jaccard(query, s) > 0.15:
+                return True
+        return False
+
+    def hipporag_find_seeds(
+        self,
+        tenant_id: str,
+        query: Optional[str] = None,
+        seed_entities: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
+        candidate_limit: int = 10,
+        min_similarity: float = 0.45,
+    ) -> Dict[str, float]:
+        """Hybrid seed entity discovery via explicit entities, alias matching, and vector search."""
+        seed_scores: Dict[str, float] = {}
+
+        # 1. Explicit seed entities
+        if seed_entities:
+            for s in seed_entities:
+                if not s or not s.strip():
+                    continue
+                try:
+                    resolved = self.resolve_entity(tenant_id=tenant_id, raw_name=s.strip(), user_id=user_id)
+                    seed_scores[resolved] = 1.0
+                except Exception:
+                    seed_scores[s.strip()] = 1.0
+
+        # 2. Query-based seed discovery
+        if query and query.strip():
+            clean_query = query.strip()
+            # 2a. N-gram alias matching (from length 4 down to 1)
+            words = [w for w in re.split(r"[\s,;:.!?]+", clean_query) if w]
+            for n in range(min(4, len(words)), 0, -1):
+                for i in range(len(words) - n + 1):
+                    phrase = " ".join(words[i : i + n])
+                    if len(phrase) < 2:
+                        continue
+                    res = self.router.query(
+                        SEMANTIC_ENTITY_FIND_BY_ALIAS,
+                        {"slug": self.slugify(phrase), "raw_name": phrase},
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                    )
+                    if res and res.result_set:
+                        row = res.result_set[0]
+                        ent_name = row[1]
+                        seed_scores[ent_name] = max(seed_scores.get(ent_name, 0.0), 1.0)
+
+            # 2b. Dense vector similarity search
+            try:
+                q_vec = self.embeddings.embed_query(clean_query)
+                res = self.router.query(
+                    HIPPORAG_SEED_VECTOR_SEARCH,
+                    {
+                        "candidate_limit": candidate_limit,
+                        "query_vec": q_vec,
+                        "min_similarity": min_similarity,
+                    },
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+                is_mock = getattr(self.embeddings, "is_mock", False) or settings.embedding_provider.lower() == "mock"
+                if res and res.result_set:
+                    for row in res.result_set:
+                        ent_name = row[0]
+                        ent_aliases = row[3] or []
+                        sim = float(row[4]) if len(row) > 4 else 0.0
+                        norm_sim = max(0.0, min(1.0, sim))
+
+                        # Bug 3 mitigation: In mock mode, reject candidates without lexical/alias overlap
+                        if is_mock and not self._has_lexical_overlap(clean_query, ent_name, ent_aliases):
+                            continue
+
+                        seed_scores[ent_name] = max(seed_scores.get(ent_name, 0.0), round(norm_sim, 4))
+            except Exception:
+                pass
+
+        return seed_scores
+
     def hipporag_retrieve(
         self,
         tenant_id: str,
