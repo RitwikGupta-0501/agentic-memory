@@ -373,6 +373,47 @@ RETURN e.id AS id,
 ORDER BY similarity DESC
 """
 
+SEMANTIC_ENTITY_FIND_BY_ALIAS = """
+MATCH (e:Entity)
+WHERE e.canonical_name = $slug
+   OR $raw_name IN coalesce(e.aliases, [])
+   OR toLower(e.name) = toLower($raw_name)
+RETURN e.id AS id,
+       e.name AS name,
+       e.canonical_name AS canonical_name,
+       e.type AS type,
+       coalesce(e.aliases, []) AS aliases
+LIMIT 1
+"""
+
+SEMANTIC_ENTITY_APPEND_ALIAS = """
+MATCH (e:Entity)
+WHERE e.name = $canonical_name OR e.canonical_name = $canonical_name
+SET e.aliases = CASE 
+    WHEN $raw_name IN coalesce(e.aliases, []) THEN coalesce(e.aliases, [])
+    ELSE coalesce(e.aliases, []) + $raw_name
+END,
+e.updated_at = $now
+RETURN e.name AS name, e.aliases AS aliases
+LIMIT 1
+"""
+
+SEMANTIC_ENTITY_VECTOR_SIMILARITY = """
+CALL db.idx.vector.queryNodes('Entity', 'embedding', $candidate_limit, vecf32($vec))
+YIELD node AS e, score
+WITH e, (1.0 - score) AS similarity
+WHERE similarity >= $threshold
+RETURN e.id AS id,
+       e.name AS name,
+       e.canonical_name AS canonical_name,
+       e.type AS type,
+       coalesce(e.aliases, []) AS aliases,
+       similarity
+ORDER BY similarity DESC
+LIMIT 1
+"""
+
+
 HIPPORAG_HYBRID_RETRIEVAL = """
 MATCH (seed:Entity)
 WHERE seed.name IN $seed_entities
@@ -591,4 +632,7 @@ CYPHER_CATALOG: Dict[str, str] = {
     "SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING": SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING,
     "SEMANTIC_PROVENANCE_UPSERT_AND_LINK": SEMANTIC_PROVENANCE_UPSERT_AND_LINK,
     "SEMANTIC_ENTITY_VECTOR_SEARCH": SEMANTIC_ENTITY_VECTOR_SEARCH,
+    "SEMANTIC_ENTITY_FIND_BY_ALIAS": SEMANTIC_ENTITY_FIND_BY_ALIAS,
+    "SEMANTIC_ENTITY_APPEND_ALIAS": SEMANTIC_ENTITY_APPEND_ALIAS,
+    "SEMANTIC_ENTITY_VECTOR_SIMILARITY": SEMANTIC_ENTITY_VECTOR_SIMILARITY,
 }
