@@ -864,31 +864,122 @@ class SemanticMemoryManager:
     def hipporag_retrieve(
         self,
         tenant_id: str,
-        seed_entities: List[str],
+        query: Optional[str] = None,
+        seed_entities: Optional[List[str]] = None,
+        top_k: int = 5,
+        damping: float = 0.85,
+        max_hops: int = 2,
+        as_of: Optional[float] = None,
         user_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Hybrid HippoRAG retrieval: Seed entities -> 2-hop active neighborhood expansion."""
-        if not seed_entities:
-            return {"seeds": [], "subgraph": []}
+    ) -> HippoRAGResult:
+        """Executes NeurIPS 2024 HippoRAG associative retrieval over active knowledge graph."""
+        target_t = float(as_of) if as_of is not None else time.time()
 
-        res = self.router.query(
-            HIPPORAG_HYBRID_RETRIEVAL,
-            {"seed_entities": seed_entities},
+        # Step 1: Hybrid Seed Discovery (lexical exact + alias + vector with mock guards)
+        seed_scores = self.hipporag_find_seeds(
+            tenant_id=tenant_id,
+            query=query,
+            seed_entities=seed_entities,
+            user_id=user_id,
+        )
+
+        if not seed_scores:
+            return HippoRAGResult(
+                status="NO_SEEDS_FOUND",
+                seeds=[],
+                seed_scores={},
+                as_of=target_t,
+                ranked_entities=[],
+                ranked_episodes=[],
+                active_subgraph_edges=[],
+            )
+
+        seeds = list(seed_scores.keys())
+
+        # Step 2: Fetch Active Subgraph within max_hops (bi-temporal filtering)
+        subgraph_res = self.router.query(
+            HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION,
+            {
+                "seed_names": seeds,
+                "as_of": target_t,
+                "max_hops": max(1, min(3, max_hops)),
+            },
             tenant_id=tenant_id,
             user_id=user_id,
         )
 
-        results = []
-        if res and res.result_set:
-            for row in res.result_set:
-                seed_node = row[0]
-                results.append({
-                    "seed": getattr(seed_node, "properties", {}).get("name", str(seed_node)),
-                    "path_count": len(row[1]) if row[1] else 0,
-                    "episodes_count": len(row[2]) if row[2] else 0,
-                })
+        adj: Dict[str, List[Tuple[str, float]]] = {}
+        edges: List[Dict[str, Any]] = []
+        all_nodes_set = set(seeds)
 
-        return {"seeds": seed_entities, "matches": results}
+        if subgraph_res and subgraph_res.result_set:
+            for row in subgraph_res.result_set:
+                src = row[0]
+                pred = row[1]
+                tgt = row[2]
+                w = float(row[3]) if row[3] is not None else 1.0
+                v_from = float(row[4]) if row[4] is not None else 0.0
+                v_to = float(row[5]) if row[5] is not None else None
+
+                edges.append({
+                    "source": src,
+                    "predicate": pred,
+                    "target": tgt,
+                    "weight": w,
+                    "valid_from": v_from,
+                    "valid_to": v_to,
+                })
+                # Undirected graph for spreading activation (Collins & Loftus 1975)
+                adj.setdefault(src, []).append((tgt, w))
+                adj.setdefault(tgt, []).append((src, w))
+                all_nodes_set.add(src)
+                all_nodes_set.add(tgt)
+
+        # Step 3: Compute Personalized PageRank spreading activation
+        all_nodes = sorted(list(all_nodes_set))
+        p0 = {u: seed_scores.get(u, 0.0) for u in all_nodes}
+        raw_pi, norm_pi = _compute_personalized_pagerank(
+            adj=adj,
+            p0=p0,
+            all_nodes=all_nodes,
+            alpha=damping,
+        )
+
+        # Step 4: Rank entities
+        sorted_nodes = sorted(
+            all_nodes,
+            key=lambda u: (norm_pi.get(u, 0.0), raw_pi.get(u, 0.0)),
+            reverse=True,
+        )
+        ranked_entities = [
+            HippoRAGRankedEntity(
+                name=u,
+                raw_ppr=round(raw_pi.get(u, 0.0), 6),
+                degree_normalized_score=round(norm_pi.get(u, 0.0), 6),
+                is_seed=(u in seed_scores),
+            )
+            for u in sorted_nodes
+        ]
+
+        # Step 5: Bipartite Projection onto Grounded Episodes
+        ranked_episodes = self.hipporag_ground_episodes(
+            tenant_id=tenant_id,
+            norm_pi=norm_pi,
+            as_of=target_t,
+            user_id=user_id,
+            top_k=top_k,
+        )
+
+        # Step 6: Return structured result
+        return HippoRAGResult(
+            status="SUCCESS",
+            seeds=seeds,
+            seed_scores=seed_scores,
+            as_of=target_t,
+            ranked_entities=ranked_entities[:top_k * 2],
+            ranked_episodes=ranked_episodes,
+            active_subgraph_edges=edges,
+        )
 
     def _get_structured_llm(self):
         """Constructs a LangChain chat model with structured FactExtractionResult output."""
