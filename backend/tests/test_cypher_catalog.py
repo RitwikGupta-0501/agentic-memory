@@ -67,3 +67,23 @@ def test_semantic_alias_and_resolution_query_syntax():
     assert "similarity >= $threshold" in vec_q
 
 
+def test_semantic_time_travel_cypher_syntax():
+    """Verifies that point-in-time and cytoscape queries contain strict interval and null guards."""
+    snapshot_q = CYPHER_CATALOG["SEMANTIC_TIME_TRAVEL_SNAPSHOT"]
+    assert "r.valid_from <= $as_of" in snapshot_q
+    assert "r.valid_to IS NULL OR r.valid_to > $as_of" in snapshot_q
+
+    timeline_q = CYPHER_CATALOG["SEMANTIC_ENTITY_EVOLUTION_TIMELINE"]
+    assert "s.name = $entity_name OR s.canonical_name = $slug" in timeline_q
+    assert "CASE WHEN r.valid_to IS NULL THEN 'ACTIVE' ELSE 'SUPERSEDED' END AS status" in timeline_q
+
+    subgraph_q = CYPHER_CATALOG["SEMANTIC_TIME_TRAVEL_SUBGRAPH"]
+    assert "CASE WHEN r IS NOT NULL THEN" in subgraph_q
+    assert "CASE WHEN neighbor IS NOT NULL THEN neighbor.name ELSE NULL END" in subgraph_q
+
+    cyto_q = CYPHER_CATALOG["SEMANTIC_CYTOSCAPE_TIME_TRAVEL"]
+    assert "CASE WHEN r IS NOT NULL THEN" in cyto_q
+    assert "$include_invalidated = true" in cyto_q
+
+
+

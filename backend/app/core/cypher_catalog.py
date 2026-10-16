@@ -413,6 +413,91 @@ ORDER BY similarity DESC
 LIMIT 1
 """
 
+SEMANTIC_TIME_TRAVEL_SNAPSHOT = """
+MATCH (s:Entity)-[r:RELATES_TO]->(o:Entity)
+WHERE r.valid_from <= $as_of 
+  AND (r.valid_to IS NULL OR r.valid_to > $as_of)
+RETURN s.name AS subject,
+       s.type AS subject_type,
+       r.predicate AS predicate,
+       r.cardinality AS cardinality,
+       r.confidence AS confidence,
+       r.valid_from AS valid_from,
+       r.valid_to AS valid_to,
+       r.source_episode AS source_episode,
+       o.name AS object,
+       o.type AS object_type
+ORDER BY s.name ASC, r.predicate ASC
+"""
+
+SEMANTIC_ENTITY_EVOLUTION_TIMELINE = """
+MATCH (s:Entity)-[r:RELATES_TO]->(o:Entity)
+WHERE s.name = $entity_name OR s.canonical_name = $slug OR $entity_name IN coalesce(s.aliases, [])
+RETURN s.name AS subject,
+       r.predicate AS predicate,
+       o.name AS object,
+       r.cardinality AS cardinality,
+       r.confidence AS confidence,
+       r.valid_from AS valid_from,
+       r.valid_to AS valid_to,
+       r.source_episode AS source_episode,
+       r.invalidated_by_episode AS invalidated_by_episode,
+       CASE WHEN r.valid_to IS NULL THEN 'ACTIVE' ELSE 'SUPERSEDED' END AS status
+ORDER BY r.valid_from ASC
+"""
+
+SEMANTIC_TIME_TRAVEL_SUBGRAPH = """
+MATCH (seed:Entity)
+WHERE seed.name = $seed_name OR seed.canonical_name = $slug OR $seed_name IN coalesce(seed.aliases, [])
+OPTIONAL MATCH (seed)-[r:RELATES_TO]-(neighbor:Entity)
+WHERE r.valid_from <= $as_of 
+  AND (r.valid_to IS NULL OR r.valid_to > $as_of)
+RETURN seed.name AS seed,
+       seed.type AS seed_type,
+       collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
+           source: startNode(r).name,
+           predicate: r.predicate,
+           target: endNode(r).name,
+           cardinality: r.cardinality,
+           valid_from: r.valid_from,
+           valid_to: r.valid_to,
+           status: CASE WHEN r.valid_to IS NULL THEN 'ACTIVE' ELSE 'SUPERSEDED' END
+       } ELSE NULL END) AS relationships,
+       collect(DISTINCT CASE WHEN neighbor IS NOT NULL THEN neighbor.name ELSE NULL END) AS neighbors
+"""
+
+SEMANTIC_CYTOSCAPE_TIME_TRAVEL = """
+MATCH (n:Entity)
+WHERE n.created_at <= $as_of
+OPTIONAL MATCH (n)-[r:RELATES_TO]->(m:Entity)
+WHERE r.valid_from <= $as_of 
+  AND (
+      (r.valid_to IS NULL OR r.valid_to > $as_of)
+      OR ($include_invalidated = true AND r.valid_to <= $as_of)
+  )
+RETURN collect(DISTINCT {
+    id: n.id,
+    name: n.name,
+    canonical_name: n.canonical_name,
+    type: n.type,
+    created_at: n.created_at
+}) AS nodes,
+collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
+    id: id(r),
+    source: n.name,
+    target: m.name,
+    predicate: r.predicate,
+    cardinality: r.cardinality,
+    valid_from: r.valid_from,
+    valid_to: r.valid_to,
+    status: CASE 
+        WHEN r.valid_to IS NULL OR r.valid_to > $as_of THEN 'ACTIVE'
+        ELSE 'INVALIDATED'
+    END
+} ELSE NULL END) AS edges
+"""
+
+
 
 HIPPORAG_HYBRID_RETRIEVAL = """
 MATCH (seed:Entity)
@@ -635,4 +720,9 @@ CYPHER_CATALOG: Dict[str, str] = {
     "SEMANTIC_ENTITY_FIND_BY_ALIAS": SEMANTIC_ENTITY_FIND_BY_ALIAS,
     "SEMANTIC_ENTITY_APPEND_ALIAS": SEMANTIC_ENTITY_APPEND_ALIAS,
     "SEMANTIC_ENTITY_VECTOR_SIMILARITY": SEMANTIC_ENTITY_VECTOR_SIMILARITY,
+    "SEMANTIC_TIME_TRAVEL_SNAPSHOT": SEMANTIC_TIME_TRAVEL_SNAPSHOT,
+    "SEMANTIC_ENTITY_EVOLUTION_TIMELINE": SEMANTIC_ENTITY_EVOLUTION_TIMELINE,
+    "SEMANTIC_TIME_TRAVEL_SUBGRAPH": SEMANTIC_TIME_TRAVEL_SUBGRAPH,
+    "SEMANTIC_CYTOSCAPE_TIME_TRAVEL": SEMANTIC_CYTOSCAPE_TIME_TRAVEL,
 }
+
