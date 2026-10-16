@@ -438,6 +438,91 @@ class SemanticMemoryManager:
                 })
         return facts
 
+    def get_entity_history(
+        self,
+        tenant_id: str,
+        entity_name: str,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Returns the full chronological evolution of all relationships an entity participated in."""
+        clean_name = self.resolve_entity(tenant_id, entity_name, user_id=user_id)
+        slug = self.slugify(clean_name)
+        res = self.router.query(
+            SEMANTIC_ENTITY_EVOLUTION_TIMELINE,
+            {"entity_name": clean_name, "slug": slug},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        timeline = []
+        active_count = 0
+        superseded_count = 0
+        if res and res.result_set:
+            for row in res.result_set:
+                status = row[9]
+                if status == "ACTIVE":
+                    active_count += 1
+                else:
+                    superseded_count += 1
+                timeline.append({
+                    "subject": row[0],
+                    "predicate": row[1],
+                    "object": row[2],
+                    "cardinality": row[3],
+                    "confidence": float(row[4]),
+                    "valid_from": float(row[5]),
+                    "valid_to": float(row[6]) if row[6] is not None else None,
+                    "source_episode": row[7],
+                    "invalidated_by_episode": row[8],
+                    "status": status,
+                })
+        return {
+            "entity_name": clean_name,
+            "total_transitions": len(timeline),
+            "active_facts_count": active_count,
+            "superseded_facts_count": superseded_count,
+            "timeline": timeline,
+        }
+
+    def get_time_travel_subgraph(
+        self,
+        tenant_id: str,
+        seed_entity: str,
+        as_of: Optional[float] = None,
+        depth: int = 1,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Returns point-in-time neighborhood view around a seed entity."""
+        target_t = float(as_of) if as_of is not None else time.time()
+        clean_name = self.resolve_entity(tenant_id, seed_entity, user_id=user_id)
+        slug = self.slugify(clean_name)
+        res = self.router.query(
+            SEMANTIC_TIME_TRAVEL_SUBGRAPH,
+            {"seed_name": clean_name, "slug": slug, "as_of": target_t},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if res and res.result_set:
+            row = res.result_set[0]
+            raw_rels = row[2] or []
+            clean_rels = [r for r in raw_rels if r and r.get("target") is not None]
+            raw_neighbors = row[3] or []
+            clean_neighbors = [n for n in raw_neighbors if n is not None]
+            return {
+                "seed": row[0],
+                "seed_type": row[1],
+                "as_of": target_t,
+                "relationships": clean_rels,
+                "neighbors": clean_neighbors,
+            }
+        return {
+            "seed": clean_name,
+            "seed_type": "Concept",
+            "as_of": target_t,
+            "relationships": [],
+            "neighbors": [],
+        }
+
+
 
     def search_entities(
         self,
