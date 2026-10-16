@@ -373,7 +373,23 @@ class SemanticMemoryManager:
             "aliases": [clean_name],
         }
 
-
+    def append_entity_alias(
+        self,
+        tenant_id: str,
+        canonical_name: str,
+        raw_alias: str,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Appends a new alias to an existing entity."""
+        res = self.router.query(
+            SEMANTIC_ENTITY_APPEND_ALIAS,
+            {"canonical_name": canonical_name, "raw_name": raw_alias.strip(), "now": time.time()},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if res and res.result_set:
+            return res.result_set[0][1] or []
+        return []
 
     def ensure_entity(
         self,

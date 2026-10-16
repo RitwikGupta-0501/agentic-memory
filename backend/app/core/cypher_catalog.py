@@ -392,6 +392,7 @@ SEMANTIC_ENTITY_FIND_BY_ALIAS = """
 MATCH (e:Entity)
 WHERE e.canonical_name = $slug
    OR $raw_name IN coalesce(e.aliases, [])
+   OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) = toLower($raw_name))
    OR toLower(e.name) = toLower($raw_name)
 RETURN e.id AS id,
        e.name AS name,
