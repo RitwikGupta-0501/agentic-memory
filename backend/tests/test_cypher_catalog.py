@@ -103,4 +103,20 @@ def test_hipporag_query_syntax():
     assert "coalesce(ep.timestamp, r.timestamp, 0.0) <= $as_of" in grounding_q
 
 
+def test_working_memory_pin_and_visualization_syntax():
+    """Verifies that WORKING_MEMORY_PIN_CONTEXT is idempotent and visualization queries contain guards."""
+    pin_q = CYPHER_CATALOG["WORKING_MEMORY_PIN_CONTEXT"]
+    assert "MERGE (st)-[r:PINNED_CONTEXT]->(target)" in pin_q
+    assert "ON CREATE SET r.relevance_reason" in pin_q
+    assert "WHERE (target:Entity OR target:Episode OR target:Procedure)" in pin_q
+
+    vis_all = CYPHER_CATALOG["VISUALIZE_ALL_GRAPH"]
+    assert "WHERE NOT n:GraphMetadata" in vis_all
+    assert "CASE WHEN r IS NOT NULL THEN" in vis_all
+
+    vis_act = CYPHER_CATALOG["VISUALIZE_ACTIVE_GRAPH"]
+    assert "WHERE NOT n:GraphMetadata" in vis_act
+    assert "CASE WHEN r IS NOT NULL THEN" in vis_act
+
+
 

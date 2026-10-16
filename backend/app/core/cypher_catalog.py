@@ -634,8 +634,12 @@ RETURN st
 
 WORKING_MEMORY_PIN_CONTEXT = """
 MATCH (st:SubTask {id: $subtask_id})
-MATCH (target) WHERE target.id = $target_id OR target.name = $target_id
-MERGE (st)-[r:PINNED_CONTEXT {relevance_reason: $reason, pinned_at: $now}]->(target)
+MATCH (target)
+WHERE (target:Entity OR target:Episode OR target:Procedure)
+  AND (target.id = $target_id OR target.name = $target_id)
+MERGE (st)-[r:PINNED_CONTEXT]->(target)
+ON CREATE SET r.relevance_reason = $reason, r.pinned_at = $now
+ON MATCH SET r.relevance_reason = $reason, r.pinned_at = $now
 RETURN r
 """
 
@@ -723,8 +727,10 @@ RETURN ci
 
 VISUALIZE_ALL_GRAPH = """
 MATCH (n)
+WHERE NOT n:GraphMetadata
 OPTIONAL MATCH (n)-[r]->(m)
-RETURN collect(DISTINCT n) AS nodes, collect(DISTINCT {
+RETURN collect(DISTINCT n) AS nodes,
+collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
     id: id(r),
     source: id(n),
     target: id(m),
@@ -733,14 +739,16 @@ RETURN collect(DISTINCT n) AS nodes, collect(DISTINCT {
     valid_to: r.valid_to,
     predicate: r.predicate,
     status: r.status
-}) AS edges
+} ELSE NULL END) AS edges
 """
 
 VISUALIZE_ACTIVE_GRAPH = """
 MATCH (n)
+WHERE NOT n:GraphMetadata
 OPTIONAL MATCH (n)-[r]->(m)
 WHERE r.valid_to IS NULL
-RETURN collect(DISTINCT n) AS nodes, collect(DISTINCT {
+RETURN collect(DISTINCT n) AS nodes,
+collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
     id: id(r),
     source: id(n),
     target: id(m),
@@ -749,7 +757,7 @@ RETURN collect(DISTINCT n) AS nodes, collect(DISTINCT {
     valid_to: r.valid_to,
     predicate: r.predicate,
     status: r.status
-}) AS edges
+} ELSE NULL END) AS edges
 """
 
 CYPHER_CATALOG: Dict[str, str] = {
