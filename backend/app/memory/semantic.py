@@ -790,6 +790,77 @@ class SemanticMemoryManager:
 
         return seed_scores
 
+    def hipporag_ground_episodes(
+        self,
+        tenant_id: str,
+        norm_pi: Dict[str, float],
+        as_of: float,
+        user_id: Optional[str] = None,
+        top_k: int = 5,
+    ) -> List[HippoRAGGroundedEpisode]:
+        """Projects entity activation mass onto episodic memory with temporal and invalidation gating."""
+        if not norm_pi:
+            return []
+
+        active_entities = [name for name, score in norm_pi.items() if score > 0.0]
+        if not active_entities:
+            return []
+
+        res = self.router.query(
+            HIPPORAG_EPISODE_GROUNDING_EXPANSION,
+            {
+                "entity_names": active_entities,
+                "as_of": as_of,
+            },
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+
+        if not res or not res.result_set:
+            return []
+
+        episodes_map: Dict[str, Dict[str, Any]] = {}
+        for row in res.result_set:
+            ent_name = row[0]
+            link_type = str(row[1]) if row[1] else "DERIVED_FROM"
+            ep_id = row[2]
+            content = row[3] or ""
+            role = row[4] or "system"
+            importance = float(row[5]) if row[5] is not None else 0.5
+            timestamp = float(row[6]) if row[6] is not None else 0.0
+
+            w_link = 1.0 if link_type == "DERIVED_FROM" else 0.6
+            ent_score = norm_pi.get(ent_name, 0.0)
+            contrib = ent_score * w_link * importance
+
+            if ep_id not in episodes_map:
+                episodes_map[ep_id] = {
+                    "episode_id": ep_id,
+                    "content": content,
+                    "role": role,
+                    "importance_score": importance,
+                    "timestamp": timestamp,
+                    "grounded_score": 0.0,
+                    "contributing_entities": set(),
+                }
+
+            episodes_map[ep_id]["grounded_score"] += contrib
+            episodes_map[ep_id]["contributing_entities"].add(ent_name)
+
+        ranked = [
+            HippoRAGGroundedEpisode(
+                episode_id=data["episode_id"],
+                content=data["content"],
+                role=data["role"],
+                importance_score=round(data["importance_score"], 4),
+                grounded_score=round(data["grounded_score"], 6),
+                contributing_entities=sorted(list(data["contributing_entities"])),
+            )
+            for data in episodes_map.values()
+        ]
+        ranked.sort(key=lambda x: x.grounded_score, reverse=True)
+        return ranked[:top_k]
+
     def hipporag_retrieve(
         self,
         tenant_id: str,
