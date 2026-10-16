@@ -1,16 +1,18 @@
-"""Semantic Memory Layer: Bi-temporal knowledge graph and HippoRAG hybrid retrieval."""
-
+import math
 import re
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.cypher_catalog import (
     BITEMPORAL_INVALIDATE_AND_UPSERT,
     HIPPORAG_HYBRID_RETRIEVAL,
+    HIPPORAG_SEED_VECTOR_SEARCH,
+    HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION,
+    HIPPORAG_EPISODE_GROUNDING_EXPANSION,
     SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING,
     SEMANTIC_PROVENANCE_UPSERT_AND_LINK,
     SEMANTIC_ENTITY_VECTOR_SEARCH,
@@ -89,6 +91,100 @@ class SemanticFactInput(BaseModel):
     cardinality: PredicateCardinality = PredicateCardinality.SINGLE
     subject_type: str = "Entity"
     object_type: str = "Entity"
+
+
+class HippoRAGRankedEntity(BaseModel):
+    name: str
+    type: str = "Concept"
+    raw_ppr: float
+    degree_normalized_score: float
+    is_seed: bool = False
+
+
+class HippoRAGGroundedEpisode(BaseModel):
+    episode_id: str
+    content: str
+    role: str = "system"
+    importance_score: float
+    grounded_score: float
+    contributing_entities: List[str] = Field(default_factory=list)
+
+
+class HippoRAGResult(BaseModel):
+    status: str = "SUCCESS"
+    seeds: List[str] = Field(default_factory=list)
+    seed_scores: Dict[str, float] = Field(default_factory=dict)
+    as_of: float
+    ranked_entities: List[HippoRAGRankedEntity] = Field(default_factory=list)
+    ranked_episodes: List[HippoRAGGroundedEpisode] = Field(default_factory=list)
+    active_subgraph_edges: List[Dict[str, Any]] = Field(default_factory=list)
+
+    def __getitem__(self, item: str) -> Any:
+        if item == "matches":
+            return [e.model_dump() for e in self.ranked_entities]
+        return getattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        if item == "matches":
+            return [e.model_dump() for e in self.ranked_entities]
+        return getattr(self, item, default)
+
+
+def _compute_personalized_pagerank(
+    adj: Dict[str, List[Tuple[str, float]]],
+    p0: Dict[str, float],
+    all_nodes: List[str],
+    alpha: float = 0.85,
+    max_iter: int = 25,
+    tol: float = 1e-5,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Executes sparse power-iteration Personalized PageRank with sublinear hub damping."""
+    if not all_nodes:
+        return {}, {}
+
+    total_p0 = sum(p0.get(u, 0.0) for u in all_nodes)
+    if total_p0 > 0:
+        norm_p0 = {u: p0.get(u, 0.0) / total_p0 for u in all_nodes}
+    else:
+        uniform_val = 1.0 / len(all_nodes)
+        norm_p0 = {u: uniform_val for u in all_nodes}
+
+    # 1. Build transition probability matrix P and degree dictionary
+    P: Dict[str, Dict[str, float]] = {}
+    deg: Dict[str, float] = {}
+    for u in all_nodes:
+        nbrs = adj.get(u, [])
+        total_w = sum(w for _, w in nbrs)
+        deg[u] = total_w
+        if total_w > 0:
+            P[u] = {v: w / total_w for v, w in nbrs}
+        else:
+            P[u] = {}
+
+    pi = dict(norm_p0)
+    for _ in range(max_iter):
+        next_pi = {u: (1.0 - alpha) * norm_p0.get(u, 0.0) for u in all_nodes}
+        # Sink mass redistribution
+        sink_mass = sum(pi[u] for u in all_nodes if not P[u])
+        for u in all_nodes:
+            next_pi[u] += alpha * sink_mass * norm_p0.get(u, 0.0)
+        # Random walk transfer
+        for u, trans in P.items():
+            mass = pi.get(u, 0.0)
+            if mass > 0:
+                for v, prob in trans.items():
+                    next_pi[v] += alpha * mass * prob
+        diff = sum(abs(next_pi[u] - pi[u]) for u in all_nodes)
+        pi = next_pi
+        if diff < tol:
+            break
+
+    # Sublinear hub damping + seed prior preservation
+    norm_pi = {
+        u: (pi[u] / (1.0 + math.log1p(deg.get(u, 0.0)))) + (0.15 * norm_p0.get(u, 0.0))
+        for u in all_nodes
+    }
+    return pi, norm_pi
 
 
 
