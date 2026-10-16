@@ -463,7 +463,9 @@ def resolve_entity(
 
 ---
 
-### Phase 3: Cardinality-Aware Invalidation & Time-Travel Query Engine
+### Phase 3: Cardinality-Aware Invalidation & Time-Travel Query Engine `[COMPLETED]`
+
+> **Status:** ✅ **COMPLETED** (Delivered via `feat/semantic-phase3-bitemporal-timetravel` — 68/68 Unit & Integration Tests Passing, Cardinality-aware invalidation with subject-tracked `[:INVALIDATED_RELATION]`, idempotent active edge refresh, half-open $[t_s, t_e)$ point-in-time snapshotting, entity evolution timelines, subgraph time-travel, Cytoscape dual-edge visualization with phantom null guards, and complete REST API test coverage)
 
 #### Objective
 Implement zero-defect bi-temporal edge management that distinguishes single-valued (functional) predicates from multi-valued predicates, alongside an arbitrary-point-in-time ("Time-Travel") query engine.
@@ -471,12 +473,12 @@ Implement zero-defect bi-temporal edge management that distinguishes single-valu
 #### Cardinality-Aware Invalidation Logic
 When an agent asserts fact $(S, P, O_{\text{new}})$ with source episode $E$:
 1. If $P$ is marked `SINGLE` (functional):
-   - Find existing active edges: `MATCH (s:Entity {name: $s})-[old_r:RELATES_TO {predicate: $p}]->(old_o:Entity) WHERE old_r.valid_to IS NULL AND old_o.name <> $o_new`.
-   - Atomically mutate: `SET old_r.valid_to = $now, old_r.invalidated_by_episode = $episode_id`.
-   - Create edge `(E)-[:INVALIDATED_RELATION {predicate: $p}]->(old_o)`.
+   - Invalidate previous active edge: `OPTIONAL MATCH (s_prev:Entity {name: $s})-[old_r:RELATES_TO {predicate: $p}]->(old_o:Entity) WHERE old_r.valid_to IS NULL AND $cardinality = 'SINGLE' AND old_o.name <> $o_new SET old_r.valid_to = $now, old_r.invalidated_by_episode = $episode_id`.
+   - Materialize invalidation link: `MERGE (E)-[:INVALIDATED_RELATION {subject: $s, predicate: $p}]->(old_o)`.
+   - Refresh active edge idempotently to avoid duplicate parallel active edges.
 2. If $P$ is marked `MULTI`:
    - Existing active edges are preserved untouched.
-   - A new active edge $(S, P, O_{\text{new}})$ is added to the graph.
+   - A new active edge $(S, P, O_{\text{new}})$ is added to the graph without invalidation.
 
 ```mermaid
 sequenceDiagram
@@ -485,95 +487,181 @@ sequenceDiagram
     participant Manager as SemanticMemoryManager
     participant Falkor as FalkorDB Engine
 
-    Agent->>Manager: upsert_fact(subject="Prod_DB", predicate="USES_TECH", object="FalkorDB", episode="ep_2", cardinality=SINGLE)
-    Manager->>Falkor: SEMANTIC_BITEMPORAL_UPSERT (now=t2, ep="ep_2")
-    Note over Falkor: 1. Locate active USES_TECH edge to PostgreSQL<br/>2. SET old_r.valid_to = t2, invalidated_by_episode = 'ep_2'<br/>3. CREATE new active USES_TECH edge to FalkorDB<br/>4. Materialize bidirectional [:DERIVED_FROM] & [:EXTRACTED_FACT]
-    Falkor-->>Manager: {invalidated_count: 1, new_edge_id: ...}
-    Manager-->>Agent: Fact successfully updated with bi-temporal audit trail
+    Note over Agent, Falkor: T1: Ingestion
+    Agent->>Manager: upsert_fact("Prod_DB", "USES_TECH", "PostgreSQL", ep="ep_1", card=SINGLE, timestamp=T1)
+    Manager->>Falkor: SEMANTIC_PROVENANCE_UPSERT_AND_LINK (valid_from=T1, valid_to=NULL)
+    Falkor-->>Manager: Edge active (PostgreSQL)
+
+    Note over Agent, Falkor: T2: Technology Migration
+    Agent->>Manager: upsert_fact("Prod_DB", "USES_TECH", "FalkorDB", ep="ep_2", card=SINGLE, timestamp=T2)
+    Manager->>Falkor: SEMANTIC_PROVENANCE_UPSERT_AND_LINK (now=T2)
+    Note over Falkor: 1. Invalidate PostgreSQL (valid_to=T2, invalidated_by_episode='ep_2')<br/>2. CREATE (ep_2)-[:INVALIDATED_RELATION {subject: 'Prod_DB'}]->(PostgreSQL)<br/>3. Close/refresh existing active edge<br/>4. CREATE active edge to FalkorDB (valid_from=T2, valid_to=NULL)<br/>5. Materialize [:DERIVED_FROM] & [:EXTRACTED_FACT]
+    Falkor-->>Manager: {invalidated_count: 1, new_edge: FalkorDB}
+
+    Note over Agent, Falkor: T3: Historical Time-Travel Query
+    Agent->>Manager: get_snapshot(tenant_id, as_of=T1)
+    Manager->>Falkor: SEMANTIC_TIME_TRAVEL_SNAPSHOT (as_of=T1)
+    Falkor-->>Manager: Returns Prod_DB USES_TECH PostgreSQL
+    
+    Agent->>Manager: get_snapshot(tenant_id, as_of=T2)
+    Manager->>Falkor: SEMANTIC_TIME_TRAVEL_SNAPSHOT (as_of=T2)
+    Falkor-->>Manager: Returns Prod_DB USES_TECH FalkorDB
 ```
 
 #### Production Cypher Queries (`cypher_catalog.py`)
 
 ```cypher
-// SEMANTIC_BITEMPORAL_UPSERT
-// 1. Invalidate conflicting single-valued active relations
-MATCH (s:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
+// SEMANTIC_PROVENANCE_UPSERT_AND_LINK
+// 1. Invalidate conflicting functional single-valued active relations if requested
+OPTIONAL MATCH (s_prev:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
 WHERE old_r.valid_to IS NULL 
   AND $cardinality = 'SINGLE' 
-  AND old_o.name <> $new_object
+  AND old_o.name <> $object
 SET old_r.valid_to = $now,
     old_r.invalidated_by_episode = $episode_id
-WITH count(old_r) AS invalidated_count
+WITH count(old_r) AS invalidated_count, collect(DISTINCT old_o) AS invalidated_objects
 
-// 2. Ensure entities exist and have embeddings
+// 2. Ensure Subject Entity exists
 MERGE (s:Entity {name: $subject})
-ON CREATE SET s.canonical_name = $subject_canonical,
-              s.type = $subject_type,
-              s.created_at = $now,
-              s.updated_at = $now,
-              s.embedding = vecf32($subject_vec)
-ON MATCH SET s.updated_at = $now
+ON CREATE SET
+    s.id = $subject_id,
+    s.canonical_name = $subject_canonical,
+    s.type = $subject_type,
+    s.aliases = [$subject],
+    s.created_at = $now,
+    s.updated_at = $now,
+    s.embedding = CASE WHEN $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE NULL END
+ON MATCH SET
+    s.updated_at = $now
 
-MERGE (o:Entity {name: $new_object})
-ON CREATE SET o.canonical_name = $object_canonical,
-              o.type = $object_type,
-              o.created_at = $now,
-              o.updated_at = $now,
-              o.embedding = vecf32($object_vec)
-ON MATCH SET o.updated_at = $now
+// 3. Ensure Object Entity exists
+MERGE (o:Entity {name: $object})
+ON CREATE SET
+    o.id = $object_id,
+    o.canonical_name = $object_canonical,
+    o.type = $object_type,
+    o.aliases = [$object],
+    o.created_at = $now,
+    o.updated_at = $now,
+    o.embedding = CASE WHEN $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE NULL END
+ON MATCH SET
+    o.updated_at = $now
 
-// 3. Create new active bi-temporal edge
+// 4. Upsert active bi-temporal edge (prevent parallel active duplicate edges)
+WITH s, o, invalidated_count, invalidated_objects
+OPTIONAL MATCH (s)-[existing_r:RELATES_TO {predicate: $predicate}]->(o)
+WHERE existing_r.valid_to IS NULL
+DELETE existing_r
 CREATE (s)-[new_r:RELATES_TO {
     predicate: $predicate,
     cardinality: $cardinality,
     confidence: $confidence,
-    valid_from: $now,
+    valid_from: coalesce(existing_r.valid_from, $now),
     valid_to: NULL,
     transaction_from: $now,
     source_episode: $episode_id
 }]->(o)
 
-// 4. Materialize bidirectional cross-layer provenance
-WITH invalidated_count, new_r, s, o
-MATCH (ep:Episode {id: $episode_id})
-MERGE (s)-[:MENTIONED_IN {timestamp: $now}]->(ep)
-MERGE (o)-[:MENTIONED_IN {timestamp: $now}]->(ep)
-MERGE (o)-[:DERIVED_FROM {timestamp: $now}]->(ep)
-MERGE (ep)-[:EXTRACTED_FACT {timestamp: $now}]->(o)
-RETURN invalidated_count, new_r
+// 5. Establish full bidirectional cross-layer provenance to Episode
+WITH invalidated_count, invalidated_objects, new_r, s, o
+MERGE (ep:Episode {id: $episode_id})
+ON CREATE SET ep.timestamp = $now, ep.role = 'system', ep.archived = false
+MERGE (s)-[m_s:MENTIONED_IN]->(ep)
+ON CREATE SET m_s.timestamp = $now
+MERGE (o)-[m_o:MENTIONED_IN]->(ep)
+ON CREATE SET m_o.timestamp = $now
+MERGE (o)-[d:DERIVED_FROM]->(ep)
+ON CREATE SET d.timestamp = $now
+MERGE (ep)-[ef:EXTRACTED_FACT {predicate: $predicate}]->(o)
+ON CREATE SET ef.timestamp = $now
+
+// 6. Materialize explicit invalidation edges from episode to superseded entities with subject tracking
+FOREACH (inv_obj IN invalidated_objects |
+    MERGE (ep)-[inv_r:INVALIDATED_RELATION {subject: $subject, predicate: $predicate}]->(inv_obj)
+    ON CREATE SET inv_r.timestamp = $now
+)
+
+RETURN invalidated_count,
+       s.name AS subject,
+       new_r.predicate AS predicate,
+       o.name AS object,
+       new_r.valid_from AS valid_from,
+       ep.id AS source_episode
 ```
 
 ```cypher
-// SEMANTIC_TIME_TRAVEL_QUERY
+// SEMANTIC_TIME_TRAVEL_SNAPSHOT
 MATCH (s:Entity)-[r:RELATES_TO]->(o:Entity)
 WHERE r.valid_from <= $as_of 
   AND (r.valid_to IS NULL OR r.valid_to > $as_of)
 RETURN s.name AS subject,
+       s.type AS subject_type,
        r.predicate AS predicate,
-       o.name AS object,
+       r.cardinality AS cardinality,
+       r.confidence AS confidence,
        r.valid_from AS valid_from,
        r.valid_to AS valid_to,
        r.source_episode AS source_episode,
-       r.confidence AS confidence
-ORDER BY s.name ASC
+       o.name AS object,
+       o.type AS object_type
+ORDER BY s.name ASC, r.predicate ASC
+```
+
+```cypher
+// SEMANTIC_CYTOSCAPE_TIME_TRAVEL (Guarded Against Phantom Null Edges)
+MATCH (n:Entity)
+WHERE n.created_at <= $as_of
+OPTIONAL MATCH (n)-[r:RELATES_TO]->(m:Entity)
+WHERE r.valid_from <= $as_of 
+  AND (
+      (r.valid_to IS NULL OR r.valid_to > $as_of)
+      OR ($include_invalidated = true AND r.valid_to <= $as_of)
+  )
+RETURN collect(DISTINCT {
+    id: n.id,
+    name: n.name,
+    canonical_name: n.canonical_name,
+    type: n.type,
+    created_at: n.created_at
+}) AS nodes,
+collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
+    id: id(r),
+    source: n.name,
+    target: m.name,
+    predicate: r.predicate,
+    cardinality: r.cardinality,
+    valid_from: r.valid_from,
+    valid_to: r.valid_to,
+    status: CASE 
+        WHEN r.valid_to IS NULL OR r.valid_to > $as_of THEN 'ACTIVE'
+        ELSE 'INVALIDATED'
+    END
+} ELSE NULL END) AS edges
 ```
 
 #### Falsifiable Requirements
 
-1. **R3.1 - Atomic Functional Invalidation**:
-   - *Current:* Hardcoded deletion logic without cardinality gating.
-   - *Target:* Updating a `SINGLE` predicate sets `valid_to` and `invalidated_by_episode` on the previous active edge in one atomic query.
-   - *Acceptance:* Unit test asserts that superseded edge has `valid_to == t2` and `invalidated_by_episode == 'ep_2'`.
+1. **R3.1 - Atomic Functional Invalidation & Idempotent Refresh**:
+   - *Target:* Updating a `SINGLE` predicate sets `valid_to` and `invalidated_by_episode` on the previous active edge in one atomic query. Re-asserting identical facts refreshes without duplicate parallel active edges.
+   - *Acceptance:* Unit test `test_functional_invalidation_and_idempotency` asserting `(ep_2)-[:INVALIDATED_RELATION {subject: 'Prod_DB'}]->(PostgreSQL)` and exactly 1 active FalkorDB edge.
 
 2. **R3.2 - Multi-Valued Edge Preservation**:
-   - *Current:* Ingestion overwrites existing edges regardless of predicate meaning.
-   - *Target:* Ingesting multiple `CONNECTED_TO` edges allows both edges to remain active concurrently (`valid_to IS NULL`).
-   - *Acceptance:* Unit test verifying that adding a second connection does not invalidate the first.
+   - *Target:* Ingesting multiple `CONNECTS_TO` edges allows all edges to remain active concurrently (`valid_to IS NULL`).
+   - *Acceptance:* Unit test `test_multi_valued_coexistence` verifying that 3 connections coexist concurrently without invalidation.
 
-3. **R3.3 - Historical Time-Travel Accuracy**:
-   - *Current:* Time-travel queries do not exist.
-   - *Target:* `get_semantic_subgraph(tenant_id, as_of_timestamp=t1)` accurately returns `PostgreSQL` as active, while `as_of_timestamp=t2` returns `FalkorDB` as active.
-   - *Acceptance:* Integration test asserting exact point-in-time graph state reconstruction at both $t_1$ and $t_2$.
+3. **R3.3 - Historical Time-Travel Accuracy & Half-Open Intervals**:
+   - *Target:* `get_snapshot(tenant_id, as_of=t1)` accurately returns `PostgreSQL` as active, while `as_of=t2` returns `FalkorDB` as active. Strictly adheres to $[t_s, t_e)$ half-open interval semantics at boundaries.
+   - *Acceptance:* Integration tests `test_point_in_time_reconstruction` and `test_subsecond_precision_and_boundary_collisions`.
+
+#### Phase 3 Execution Roadmap (8 Atomic Commits)
+- **Commit 1:** `feat(cypher): add hardened time-travel snapshot, entity evolution, and cytoscape queries`
+- **Commit 2:** `feat(semantic): materialize [:INVALIDATED_RELATION] with subject tracking and idempotent active edge refresh`
+- **Commit 3:** `feat(semantic): implement point-in-time get_snapshot engine with half-open interval semantics`
+- **Commit 4:** `feat(semantic): implement get_entity_history and get_time_travel_subgraph engines`
+- **Commit 5:** `feat(semantic): implement Cytoscape dual-edge time-travel serializer with phantom null guards`
+- **Commit 6:** `feat(api): expose REST endpoints for snapshot, history, time-travel, and cytoscape`
+- **Commit 7:** `test(semantic): add comprehensive falsifiable test suite in test_semantic_bitemporal_timetravel.py`
+- **Commit 8:** `docs: record Semantic Memory Phase 3 completion in master tracking plan`
 
 ---
 
