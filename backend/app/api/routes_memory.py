@@ -1,5 +1,4 @@
-"""API endpoints for 4-tier cognitive memory graph retrieval and mutations."""
-
+import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
@@ -10,9 +9,10 @@ from app.core.embeddings.reindexer import reindex_tenant_embeddings
 from app.core.falkor_client import falkor_router
 from app.memory.episodic import episodic_memory
 from app.memory.importance import importance_scorer
-from app.memory.semantic import semantic_memory, EntityTriple
+from app.memory.semantic import semantic_memory, EntityTriple, FactExtractionResult
 
 router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
+
 
 
 class FactUpsertRequest(BaseModel):
@@ -458,6 +458,71 @@ def upsert_semantic_fact_v2(req: SemanticFactRequest) -> Dict[str, Any]:
         "status": "SUCCESS",
         "fact": res,
     }
+
+
+class SemanticExtractRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    text: str = Field(..., min_length=1)
+    persist: bool = Field(default=False, description="Whether to immediately upsert extracted facts into the graph")
+    episode_id: Optional[str] = Field(default=None, description="Episode ID to anchor facts to if persisting")
+    user_id: Optional[str] = None
+
+
+class EntityResolveRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    name: str = Field(..., min_length=1)
+    type: str = Field(default="Concept")
+    user_id: Optional[str] = None
+
+
+@router.post("/semantic/extract")
+def extract_semantic_facts_endpoint(req: SemanticExtractRequest) -> Dict[str, Any]:
+    """Extracts structured OpenIE facts using real LLM or multi-domain fallback."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    result = semantic_memory.extract_facts(req.text)
+
+    persisted_facts = []
+    if req.persist:
+        ep_id = req.episode_id or f"ep_{uuid.uuid4().hex[:8]}"
+        for t in result.triples:
+            fact_res = semantic_memory.upsert_fact(
+                tenant_id=t_id,
+                subject=t.subject,
+                predicate=t.predicate,
+                new_object=t.object,
+                episode_id=ep_id,
+                confidence=t.confidence,
+                cardinality=t.cardinality,
+                subject_type=t.subject_type,
+                object_type=t.object_type,
+                user_id=req.user_id,
+            )
+            persisted_facts.append(fact_res)
+
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "result": result.model_dump(),
+        "persisted_facts": persisted_facts,
+    }
+
+
+@router.post("/semantic/resolve")
+def resolve_entity_endpoint(req: EntityResolveRequest) -> Dict[str, Any]:
+    """Resolves an entity mention to its canonical identity using 3-step resolution."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    resolution = semantic_memory.resolve_entity_detailed(
+        tenant_id=t_id,
+        raw_name=req.name,
+        entity_type=req.type,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "resolution": resolution,
+    }
+
 
 
 
