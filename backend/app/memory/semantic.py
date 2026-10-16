@@ -7,15 +7,20 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+from app.core.config import settings
 from app.core.cypher_catalog import (
     BITEMPORAL_INVALIDATE_AND_UPSERT,
     HIPPORAG_HYBRID_RETRIEVAL,
     SEMANTIC_ENTITY_MERGE_WITH_EMBEDDING,
     SEMANTIC_PROVENANCE_UPSERT_AND_LINK,
     SEMANTIC_ENTITY_VECTOR_SEARCH,
+    SEMANTIC_ENTITY_FIND_BY_ALIAS,
+    SEMANTIC_ENTITY_APPEND_ALIAS,
+    SEMANTIC_ENTITY_VECTOR_SIMILARITY,
 )
 from app.core.falkor_client import falkor_router
 from app.core.embeddings.factory import embedding_service
+
 
 
 class PredicateCardinality(str, Enum):
@@ -65,6 +70,142 @@ class SemanticMemoryManager:
         """Normalizes an entity name to a canonical lowercase slug."""
         clean = re.sub(r"[^a-z0-9]", "_", name.lower().strip())
         return re.sub(r"_+", "_", clean).strip("_")
+
+    @staticmethod
+    def _token_jaccard(a: str, b: str) -> float:
+        """Calculates token-level Jaccard similarity across punctuation/whitespace splits."""
+        set_a = set(re.split(r"[\s_\-]+", a.lower().strip()))
+        set_b = set(re.split(r"[\s_\-]+", b.lower().strip()))
+        if not set_a or not set_b:
+            return 0.0
+        intersection = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return intersection / union if union > 0 else 0.0
+
+    def resolve_entity(
+        self,
+        tenant_id: str,
+        raw_name: str,
+        entity_type: str = "Concept",
+        user_id: Optional[str] = None,
+    ) -> str:
+        """Resolves a raw entity mention or alias to its canonical name."""
+        details = self.resolve_entity_detailed(
+            tenant_id=tenant_id,
+            raw_name=raw_name,
+            entity_type=entity_type,
+            user_id=user_id,
+        )
+        return details["canonical_name"]
+
+    def resolve_entity_detailed(
+        self,
+        tenant_id: str,
+        raw_name: str,
+        entity_type: str = "Concept",
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Executes 3-step entity resolution (canonical slug/alias -> dense vector similarity -> Jaccard fallback)."""
+        clean_name = raw_name.strip()
+        if not clean_name:
+            return {
+                "raw_name": raw_name,
+                "canonical_name": raw_name,
+                "resolved": False,
+                "method": "empty_input",
+                "similarity": 0.0,
+                "aliases": [],
+            }
+
+        slug = self.slugify(clean_name)
+
+        # Step 1: Exact canonical slug or alias array match
+        exact_match = self.router.query(
+            SEMANTIC_ENTITY_FIND_BY_ALIAS,
+            {"slug": slug, "raw_name": clean_name},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if exact_match and exact_match.result_set:
+            row = exact_match.result_set[0]
+            matched_name = row[1]
+            aliases = row[4] or []
+            return {
+                "raw_name": clean_name,
+                "canonical_name": matched_name,
+                "resolved": matched_name.lower() != clean_name.lower(),
+                "method": "exact_match",
+                "similarity": 1.0,
+                "aliases": aliases,
+            }
+
+        # Step 2: Dense vector similarity search with adaptive threshold
+        threshold = 0.50 if settings.embedding_provider == "mock" else 0.85
+        vec = self.embeddings.embed_query(clean_name)
+
+        vector_match = self.router.query(
+            SEMANTIC_ENTITY_VECTOR_SIMILARITY,
+            {"candidate_limit": 5, "vec": vec, "threshold": threshold},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if vector_match and vector_match.result_set:
+            row = vector_match.result_set[0]
+            matched_name = row[1]
+            sim = float(row[5]) if len(row) > 5 else 1.0
+
+            # Step 3: Append alias deduplicated to existing node
+            now = time.time()
+            append_res = self.router.query(
+                SEMANTIC_ENTITY_APPEND_ALIAS,
+                {"canonical_name": matched_name, "raw_name": clean_name, "now": now},
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            updated_aliases = []
+            if append_res and append_res.result_set:
+                updated_aliases = append_res.result_set[0][1] or []
+
+            return {
+                "raw_name": clean_name,
+                "canonical_name": matched_name,
+                "resolved": True,
+                "method": "vector_similarity",
+                "similarity": round(sim, 4),
+                "aliases": updated_aliases,
+            }
+
+        # Lexical Jaccard token overlap fallback (especially useful for mock provider)
+        all_entities = self.search_entities(tenant_id=tenant_id, query=clean_name, limit=10, user_id=user_id)
+        for ent in all_entities:
+            jaccard = self._token_jaccard(clean_name, ent["name"])
+            if jaccard >= 0.50:
+                now = time.time()
+                self.router.query(
+                    SEMANTIC_ENTITY_APPEND_ALIAS,
+                    {"canonical_name": ent["name"], "raw_name": clean_name, "now": now},
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+                return {
+                    "raw_name": clean_name,
+                    "canonical_name": ent["name"],
+                    "resolved": True,
+                    "method": "lexical_jaccard",
+                    "similarity": round(jaccard, 4),
+                    "aliases": ent.get("aliases", []),
+                }
+
+        # Novel entity (not found in graph)
+        return {
+            "raw_name": clean_name,
+            "canonical_name": clean_name,
+            "resolved": False,
+            "method": "new_entity",
+            "similarity": 0.0,
+            "aliases": [clean_name],
+        }
+
 
     def ensure_entity(
         self,
@@ -133,12 +274,17 @@ class SemanticMemoryManager:
         subject_type: str = "Entity",
         object_type: str = "Entity",
         user_id: Optional[str] = None,
+        resolve_entities: bool = True,
     ) -> Dict[str, Any]:
         """Executes bi-temporal invalidation and materializes bidirectional cross-layer provenance."""
         now = time.time()
         clean_subj = subject.strip()
         clean_pred = predicate.strip().upper()
         clean_obj = new_object.strip()
+
+        if resolve_entities:
+            clean_subj = self.resolve_entity(tenant_id, clean_subj, subject_type, user_id=user_id)
+            clean_obj = self.resolve_entity(tenant_id, clean_obj, object_type, user_id=user_id)
 
         card_str = cardinality.value if isinstance(cardinality, PredicateCardinality) else str(cardinality).upper()
 
