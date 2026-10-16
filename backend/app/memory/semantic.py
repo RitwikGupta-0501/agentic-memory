@@ -522,6 +522,55 @@ class SemanticMemoryManager:
             "neighbors": [],
         }
 
+    def get_cytoscape_elements_as_of(
+        self,
+        tenant_id: str,
+        as_of: Optional[float] = None,
+        include_invalidated: bool = True,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Converts FalkorDB query results into Cytoscape.js format with visual dual-edge styling."""
+        target_t = float(as_of) if as_of is not None else time.time()
+        res = self.router.query(
+            SEMANTIC_CYTOSCAPE_TIME_TRAVEL,
+            {"as_of": target_t, "include_invalidated": include_invalidated},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        elements: Dict[str, List[Dict[str, Any]]] = {"nodes": [], "edges": []}
+        if res and res.result_set:
+            raw_nodes, raw_edges = res.result_set[0]
+            for n in raw_nodes or []:
+                if n and n.get("name"):
+                    elements["nodes"].append({
+                        "data": {
+                            "id": n["name"],
+                            "label": n["name"],
+                            "canonical_name": n.get("canonical_name", ""),
+                            "type": n.get("type", "Concept"),
+                            "created_at": n.get("created_at"),
+                        }
+                    })
+            for e in raw_edges or []:
+                if e and e.get("target") is not None:
+                    is_active = e.get("status") == "ACTIVE"
+                    elements["edges"].append({
+                        "data": {
+                            "id": f"e_{e['source']}_{e['predicate']}_{e['target']}_{int(e.get('valid_from', 0))}",
+                            "source": e["source"],
+                            "target": e["target"],
+                            "label": e["predicate"],
+                            "cardinality": e.get("cardinality", "SINGLE"),
+                            "valid_from": e.get("valid_from"),
+                            "valid_to": e.get("valid_to"),
+                            "status": e.get("status"),
+                            "line_style": "solid" if is_active else "dashed",
+                            "color": "#10b981" if is_active else "#ef4444",
+                        }
+                    })
+        return elements
+
+
 
 
     def search_entities(
