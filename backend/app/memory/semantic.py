@@ -343,9 +343,10 @@ class SemanticMemoryManager:
         object_type: str = "Entity",
         user_id: Optional[str] = None,
         resolve_entities: bool = True,
+        timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Executes bi-temporal invalidation and materializes bidirectional cross-layer provenance."""
-        now = time.time()
+        now = float(timestamp) if timestamp is not None else time.time()
         clean_subj = subject.strip()
         clean_pred = predicate.strip().upper()
         clean_obj = new_object.strip()
@@ -386,19 +387,22 @@ class SemanticMemoryManager:
         )
 
         invalidated_count = 0
+        valid_from = now
         if res and res.result_set:
             invalidated_count = res.result_set[0][0]
+            valid_from = float(res.result_set[0][4]) if res.result_set[0][4] is not None else now
 
         return {
             "subject": clean_subj,
             "predicate": clean_pred,
             "object": clean_obj,
-            "valid_from": now,
+            "valid_from": valid_from,
             "valid_to": None,
             "invalidated_count": invalidated_count,
             "source_episode": episode_id,
             "cardinality": card_str,
         }
+
 
     def search_entities(
         self,

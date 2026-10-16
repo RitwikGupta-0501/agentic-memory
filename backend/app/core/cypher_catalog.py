@@ -300,13 +300,13 @@ RETURN e.id AS id, e.name AS name, e.canonical_name AS canonical_name, e.type AS
 
 SEMANTIC_PROVENANCE_UPSERT_AND_LINK = """
 // 1. Invalidate conflicting functional single-valued active relations if requested
-MATCH (s:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
+OPTIONAL MATCH (s_prev:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
 WHERE old_r.valid_to IS NULL 
   AND $cardinality = 'SINGLE' 
   AND old_o.name <> $object
 SET old_r.valid_to = $now,
     old_r.invalidated_by_episode = $episode_id
-WITH count(old_r) AS invalidated_count
+WITH count(old_r) AS invalidated_count, collect(DISTINCT old_o) AS invalidated_objects
 
 // 2. Ensure Subject Entity exists
 MERGE (s:Entity {name: $subject})
@@ -334,24 +334,39 @@ ON CREATE SET
 ON MATCH SET
     o.updated_at = $now
 
-// 4. Create new active bi-temporal edge
+// 4. Upsert active bi-temporal edge (prevent parallel active duplicate edges)
+WITH s, o, invalidated_count, invalidated_objects
+OPTIONAL MATCH (s)-[existing_r:RELATES_TO {predicate: $predicate}]->(o)
+WHERE existing_r.valid_to IS NULL
+DELETE existing_r
 CREATE (s)-[new_r:RELATES_TO {
     predicate: $predicate,
     cardinality: $cardinality,
     confidence: $confidence,
-    valid_from: $now,
+    valid_from: coalesce(existing_r.valid_from, $now),
     valid_to: NULL,
     transaction_from: $now,
     source_episode: $episode_id
 }]->(o)
 
 // 5. Establish full bidirectional cross-layer provenance to Episode
-WITH invalidated_count, new_r, s, o
-MATCH (ep:Episode {id: $episode_id})
-MERGE (s)-[:MENTIONED_IN {timestamp: $now}]->(ep)
-MERGE (o)-[:MENTIONED_IN {timestamp: $now}]->(ep)
-MERGE (o)-[:DERIVED_FROM {timestamp: $now}]->(ep)
-MERGE (ep)-[:EXTRACTED_FACT {timestamp: $now, predicate: $predicate}]->(o)
+WITH invalidated_count, invalidated_objects, new_r, s, o
+MERGE (ep:Episode {id: $episode_id})
+ON CREATE SET ep.timestamp = $now, ep.role = 'system', ep.archived = false
+MERGE (s)-[m_s:MENTIONED_IN]->(ep)
+ON CREATE SET m_s.timestamp = $now
+MERGE (o)-[m_o:MENTIONED_IN]->(ep)
+ON CREATE SET m_o.timestamp = $now
+MERGE (o)-[d:DERIVED_FROM]->(ep)
+ON CREATE SET d.timestamp = $now
+MERGE (ep)-[ef:EXTRACTED_FACT {predicate: $predicate}]->(o)
+ON CREATE SET ef.timestamp = $now
+
+// 6. Materialize explicit invalidation edges from episode to superseded entities with subject tracking
+FOREACH (inv_obj IN invalidated_objects |
+    MERGE (ep)-[inv_r:INVALIDATED_RELATION {subject: $subject, predicate: $predicate}]->(inv_obj)
+    ON CREATE SET inv_r.timestamp = $now
+)
 
 RETURN invalidated_count,
        s.name AS subject,
