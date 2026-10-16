@@ -128,17 +128,46 @@ class MultiAgentCoordinationEngine:
         }
         await asyncio.sleep(0.4)
 
-        # Context Agent inspects Semantic Knowledge Graph
-        triples = semantic_memory.extract_triples_from_text(user_prompt)
-        for tr in triples:
+        # Context Agent inspects Semantic Knowledge Graph with full ontological metadata
+        extracted_facts = semantic_memory.extract_facts(user_prompt)
+        extracted_seeds: List[str] = []
+        for tr in extracted_facts.triples:
+            extracted_seeds.extend([tr.subject, tr.object])
             semantic_memory.upsert_fact(
                 tenant_id=tenant_id,
                 subject=tr.subject,
                 predicate=tr.predicate,
                 new_object=tr.object,
                 episode_id=ep["id"],
+                confidence=tr.confidence,
+                cardinality=tr.cardinality,
+                subject_type=tr.subject_type or "Entity",
+                object_type=tr.object_type or "Entity",
                 user_id=user_id,
             )
+
+        # Dual Cognitive Recall: Associative Semantic Recall (HippoRAG PPR)
+        unique_seeds = list(dict.fromkeys(extracted_seeds)) or None
+        hippo_res = semantic_memory.hipporag_retrieve(
+            tenant_id=tenant_id,
+            query=user_prompt,
+            seed_entities=unique_seeds,
+            top_k=3,
+            user_id=user_id,
+        )
+
+        yield {
+            "type": "hipporag_event",
+            "agent": "Context & Triage Agent",
+            "phase": "semantic_retrieval",
+            "message": f"HippoRAG associative recall identified {len(hippo_res.ranked_entities)} entity(ies) across {len(hippo_res.active_subgraph_edges)} active relations.",
+            "cypher": "CALL db.idx.vector.queryNodes('Entity'...) + Personalized PageRank + Bipartite Episode Grounding",
+            "seeds": hippo_res.seeds,
+            "ranked_entities": [e.model_dump() for e in hippo_res.ranked_entities[:3]],
+            "grounded_episodes": [ge.model_dump() for ge in hippo_res.ranked_episodes[:2]],
+            "active_edges_count": len(hippo_res.active_subgraph_edges),
+        }
+        await asyncio.sleep(0.4)
 
         # Pin context pointer
         working_memory.pin_context(
