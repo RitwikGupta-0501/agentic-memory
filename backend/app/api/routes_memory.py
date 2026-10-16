@@ -1,3 +1,4 @@
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query
@@ -17,11 +18,17 @@ router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
 
 class FactUpsertRequest(BaseModel):
     tenant_id: Optional[str] = None
-    subject: str
-    predicate: str
-    object: str
+    subject: str = Field(..., min_length=1)
+    predicate: str = Field(..., min_length=1)
+    object: str = Field(..., min_length=1)
     episode_id: Optional[str] = "ep_manual"
-    confidence: float = 1.0
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    cardinality: str = "SINGLE"
+    subject_type: str = "Entity"
+    object_type: str = "Entity"
+    user_id: Optional[str] = None
+    timestamp: Optional[float] = Field(default=None, description="Explicit event timestamp; None = system time.time()")
+
 
 
 class HippoRAGRequest(BaseModel):
@@ -198,8 +205,15 @@ def upsert_semantic_fact(req: FactUpsertRequest) -> Dict[str, Any]:
         predicate=req.predicate,
         new_object=req.object,
         episode_id=req.episode_id or "ep_manual",
+        confidence=req.confidence,
+        cardinality=req.cardinality,
+        subject_type=req.subject_type,
+        object_type=req.object_type,
+        user_id=req.user_id,
+        timestamp=req.timestamp,
     )
     return res
+
 
 
 @router.post("/hipporag")
@@ -397,6 +411,8 @@ class SemanticFactRequest(BaseModel):
     subject_type: str = "Entity"
     object_type: str = "Entity"
     user_id: Optional[str] = None
+    timestamp: Optional[float] = Field(default=None, description="Explicit event timestamp; None = system time.time()")
+
 
 
 @router.post("/semantic/entity")
@@ -452,6 +468,7 @@ def upsert_semantic_fact_v2(req: SemanticFactRequest) -> Dict[str, Any]:
         subject_type=req.subject_type,
         object_type=req.object_type,
         user_id=req.user_id,
+        timestamp=req.timestamp,
     )
     return {
         "tenant_id": t_id,
@@ -522,6 +539,85 @@ def resolve_entity_endpoint(req: EntityResolveRequest) -> Dict[str, Any]:
         "status": "SUCCESS",
         "resolution": resolution,
     }
+
+
+class TimeTravelSubgraphRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    seed_entity: str = Field(..., min_length=1)
+    as_of: Optional[float] = None
+    depth: int = Field(default=1, ge=1, le=2)
+    user_id: Optional[str] = None
+
+
+@router.get("/semantic/snapshot")
+def get_semantic_snapshot_endpoint(
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    as_of: Optional[float] = Query(default=None),
+    user_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Returns the complete point-in-time snapshot of active facts at timestamp as_of."""
+    facts = semantic_memory.get_snapshot(tenant_id=tenant_id, as_of=as_of, user_id=user_id)
+    return {
+        "tenant_id": tenant_id,
+        "as_of": as_of if as_of is not None else time.time(),
+        "fact_count": len(facts),
+        "facts": facts,
+    }
+
+
+@router.get("/semantic/history/{entity_name}")
+def get_entity_history_endpoint(
+    entity_name: str,
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    user_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Returns the full chronological evolution of all relationships an entity participated in."""
+    history = semantic_memory.get_entity_history(tenant_id=tenant_id, entity_name=entity_name, user_id=user_id)
+    return {
+        "tenant_id": tenant_id,
+        "status": "SUCCESS",
+        "history": history,
+    }
+
+
+@router.post("/semantic/time-travel")
+def time_travel_subgraph_endpoint(req: TimeTravelSubgraphRequest) -> Dict[str, Any]:
+    """Returns the point-in-time neighborhood around a seed entity as of historical timestamp as_of."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    subgraph = semantic_memory.get_time_travel_subgraph(
+        tenant_id=t_id,
+        seed_entity=req.seed_entity,
+        as_of=req.as_of,
+        depth=req.depth,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "subgraph": subgraph,
+    }
+
+
+@router.get("/semantic/cytoscape")
+def get_cytoscape_time_travel_endpoint(
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    as_of: Optional[float] = Query(default=None),
+    include_invalidated: bool = Query(default=True),
+    user_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Returns Cytoscape-formatted graph elements with time-travel active and invalidated edges."""
+    elements = semantic_memory.get_cytoscape_elements_as_of(
+        tenant_id=tenant_id,
+        as_of=as_of,
+        include_invalidated=include_invalidated,
+        user_id=user_id,
+    )
+    return {
+        "tenant_id": tenant_id,
+        "as_of": as_of if as_of is not None else time.time(),
+        "elements": elements,
+    }
+
 
 
 
