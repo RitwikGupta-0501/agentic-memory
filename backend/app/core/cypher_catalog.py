@@ -636,14 +636,15 @@ WORKING_MEMORY_ATOMIC_CLAIM = """
 MATCH (t:TaskRun {id: $task_id})-[:HAS_SUBTASK]->(st:SubTask {status: 'PENDING'})
 WHERE NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'PENDING'})
   AND NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'IN_PROGRESS'})
+  AND NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'FAILED'})
+  AND NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'BLOCKED'})
 WITH st LIMIT 1
 SET st.status = 'IN_PROGRESS',
     st.locked_by = $agent_id,
-
     st.claimed_at = $now
 WITH st
 OPTIONAL MATCH (st)-[:DEPENDS_ON]->(parent:SubTask)-[:PINNED_CONTEXT]->(ctx)
-RETURN st, collect(ctx) AS inherited_context_nodes
+RETURN st, collect(DISTINCT ctx) AS inherited_context_nodes
 """
 
 WORKING_MEMORY_COMPLETE_SUBTASK = """
@@ -652,6 +653,39 @@ SET st.status = 'COMPLETED',
     st.completed_at = $now,
     st.result_summary = $result_summary
 RETURN st
+"""
+
+WORKING_MEMORY_FAIL_SUBTASK = """
+MATCH (st:SubTask {id: $subtask_id, locked_by: $agent_id})
+SET st.status = 'FAILED',
+    st.completed_at = $now,
+    st.error_message = $error_message
+WITH st
+OPTIONAL MATCH (downstream:SubTask)-[:DEPENDS_ON]->(st)
+WHERE downstream.status = 'PENDING'
+SET downstream.status = 'BLOCKED'
+RETURN st, count(downstream) AS blocked_count
+"""
+
+TASK_DAG_STATUS_QUERY = """
+MATCH (t:TaskRun {id: $task_id})-[:HAS_SUBTASK]->(st:SubTask)
+OPTIONAL MATCH (st)-[:DEPENDS_ON]->(dep:SubTask)
+OPTIONAL MATCH (st)-[:PINNED_CONTEXT]->(ctx)
+WITH t, st, collect(DISTINCT dep.id) AS dep_ids, count(DISTINCT ctx) AS pinned_count
+RETURN t.id AS task_id,
+       t.goal AS goal,
+       t.status AS task_status,
+       collect({
+           id: st.id,
+           title: st.title,
+           description: st.description,
+           status: st.status,
+           locked_by: st.locked_by,
+           error_message: st.error_message,
+           result_summary: st.result_summary,
+           dependencies: dep_ids,
+           pinned_count: pinned_count
+       }) AS subtasks
 """
 
 WORKING_MEMORY_PIN_CONTEXT = """
@@ -792,6 +826,8 @@ CYPHER_CATALOG: Dict[str, str] = {
     "SUBTASK_ADD_DEPENDENCY": SUBTASK_ADD_DEPENDENCY,
     "WORKING_MEMORY_ATOMIC_CLAIM": WORKING_MEMORY_ATOMIC_CLAIM,
     "WORKING_MEMORY_COMPLETE_SUBTASK": WORKING_MEMORY_COMPLETE_SUBTASK,
+    "WORKING_MEMORY_FAIL_SUBTASK": WORKING_MEMORY_FAIL_SUBTASK,
+    "TASK_DAG_STATUS_QUERY": TASK_DAG_STATUS_QUERY,
     "WORKING_MEMORY_PIN_CONTEXT": WORKING_MEMORY_PIN_CONTEXT,
     "PROCEDURE_CREATE": PROCEDURE_CREATE,
     "ACTION_STEP_APPEND": ACTION_STEP_APPEND,

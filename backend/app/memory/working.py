@@ -11,6 +11,8 @@ from app.core.cypher_catalog import (
     SUBTASK_ADD_DEPENDENCY,
     WORKING_MEMORY_ATOMIC_CLAIM,
     WORKING_MEMORY_COMPLETE_SUBTASK,
+    WORKING_MEMORY_FAIL_SUBTASK,
+    TASK_DAG_STATUS_QUERY,
     WORKING_MEMORY_PIN_CONTEXT,
     MEMORY_UTILITY_FEEDBACK_UPDATE,
 )
@@ -151,6 +153,60 @@ class WorkingMemoryManager:
                 user_id=user_id,
             )
         return bool(res and res.result_set)
+
+    def fail_subtask(
+        self,
+        tenant_id: str,
+        subtask_id: str,
+        agent_id: str,
+        error_message: str,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Marks a subtask as FAILED and cascades status=BLOCKED to downstream dependent subtasks."""
+        now = time.time()
+        res = self.router.query(
+            WORKING_MEMORY_FAIL_SUBTASK,
+            {
+                "subtask_id": subtask_id,
+                "agent_id": agent_id,
+                "error_message": error_message,
+                "now": now,
+            },
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        blocked_count = 0
+        if res and res.result_set:
+            blocked_count = res.result_set[0][1] if len(res.result_set[0]) > 1 else 0
+        return {
+            "subtask_id": subtask_id,
+            "status": "FAILED",
+            "error_message": error_message,
+            "blocked_count": blocked_count,
+        }
+
+    def get_task_status(
+        self,
+        tenant_id: str,
+        task_id: str,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Returns full DAG execution state, subtasks, dependencies, and pinned contexts."""
+        res = self.router.query(
+            TASK_DAG_STATUS_QUERY,
+            {"task_id": task_id},
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if not res or not res.result_set:
+            return None
+        row = res.result_set[0]
+        return {
+            "task_id": row[0],
+            "goal": row[1],
+            "status": row[2],
+            "subtasks": row[3] or [],
+        }
 
     def pin_context(
         self,
