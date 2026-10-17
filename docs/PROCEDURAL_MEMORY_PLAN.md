@@ -178,25 +178,29 @@ Establish formal FalkorDB property schemas for `:Procedure`, `:ActionStep`, and 
     trigger_description: STRING, // Natural language activation intent
     success_count: INTEGER,      // Accumulated successful runs
     fail_count: INTEGER,         // Accumulated failed runs
+    bayesian_success_rate: FLOAT,// Beta-Binomial conjugate success rate in [0.0, 1.0]
     utility_score: FLOAT,        // MemRL Q-value in [0.0, 1.0]
     created_at: FLOAT,           // Creation epoch timestamp
     updated_at: FLOAT            // Last outcome update timestamp
 })
 
 (:ActionStep {
-    id: STRING,                  // Unique identifier: 'step_' + hex(6)
+    id: STRING,                  // Natural identifier: 'step_' + hex(6)
     step_order: INTEGER,         // 1-indexed execution order (1, 2, 3...)
     tool_name: STRING,           // Bound tool identifier: 'run_database_migration'
     param_schema: STRING,        // JSON Schema string defining parameter types and mandatory flags
-    created_at: FLOAT
+    created_at: FLOAT,
+    updated_at: FLOAT
 })
 
 (:Guardrail {
     id: STRING,                  // Unique identifier: 'gr_' + hex(6)
     rule_text: STRING,           // Human/LLM-readable prevention rule
-    error_signature: STRING,     // Deterministic failure trap code: 'ERR_NO_WAL_CHECKPOINT'
+    error_signature: STRING,     // Canonical natural key: deterministic failure trap code 'ERR_NO_WAL_CHECKPOINT'
     fix_instruction: STRING,     // Remediation parameter override instructions
-    created_at: FLOAT
+    hit_count: INTEGER,          // Number of times this trap signature has been encountered/intercepted
+    created_at: FLOAT,
+    updated_at: FLOAT
 })
 ```
 
@@ -205,13 +209,19 @@ Eliminates client-side looping. For step 1, Cypher merges `[:FIRST_STEP]`. For s
 
 ```cypher
 ACTION_STEP_APPEND = """
-MATCH (p:Procedure {id: $procedure_id})
-MERGE (step:ActionStep {
-    id: $step_id,
-    step_order: $step_order,
-    tool_name: $tool_name,
-    param_schema: $param_schema
-})
+MATCH (p:Procedure)
+WHERE p.id = $procedure_id OR p.name = $procedure_id
+MERGE (step:ActionStep {id: $step_id})
+ON CREATE SET
+    step.step_order = $step_order,
+    step.tool_name = $tool_name,
+    step.param_schema = $param_schema,
+    step.created_at = $now
+ON MATCH SET
+    step.step_order = $step_order,
+    step.tool_name = $tool_name,
+    step.param_schema = $param_schema,
+    step.updated_at = $now
 WITH p, step
 FOREACH (_ IN CASE WHEN $step_order = 1 THEN [1] ELSE [] END |
     MERGE (p)-[:FIRST_STEP]->(step)
@@ -242,10 +252,21 @@ PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS = """
 MATCH (proc:Procedure)
 WHERE proc.name = $procedure_name 
    OR toLower(proc.name) = toLower($procedure_name)
-   OR ($intent <> '' AND proc.trigger_description CONTAINS $intent)
-OPTIONAL MATCH path = (proc)-[:FIRST_STEP|NEXT_STEP*1..10]->(step:ActionStep)
+   OR ($intent <> '' AND toLower(proc.trigger_description) CONTAINS toLower($intent))
+   OR ($procedure_name <> '' AND toLower(proc.trigger_description) CONTAINS toLower($procedure_name))
+WITH proc
+ORDER BY CASE 
+    WHEN proc.name = $procedure_name THEN 0
+    WHEN toLower(proc.name) = toLower($procedure_name) THEN 1
+    ELSE 2
+END ASC, coalesce(proc.utility_score, 0.5) DESC
+LIMIT 1
+OPTIONAL MATCH (proc)-[:FIRST_STEP|NEXT_STEP*1..15]->(step:ActionStep)
 OPTIONAL MATCH (step)-[:HAS_GUARDRAIL]->(g:Guardrail)
-RETURN proc, nodes(path) AS ordered_steps, collect(DISTINCT g) AS active_guardrails
+WITH proc, step, g ORDER BY step.step_order ASC
+RETURN proc,
+       collect(DISTINCT step) AS ordered_steps,
+       collect(DISTINCT g) AS active_guardrails
 """
 ```
 
@@ -288,13 +309,18 @@ Close the multi-turn cognitive self-correction loop. When an agent tool fails, c
 ```cypher
 PROCEDURAL_GUARDRAIL_ATTACH = """
 MERGE (step:ActionStep {id: $step_id})
-MERGE (g:Guardrail {
-    id: $guardrail_id,
-    rule_text: $rule_text,
-    error_signature: $error_signature,
-    fix_instruction: $fix_instruction,
-    created_at: $now
-})
+MERGE (g:Guardrail {error_signature: $error_signature})
+ON CREATE SET
+    g.id = $guardrail_id,
+    g.rule_text = $rule_text,
+    g.fix_instruction = $fix_instruction,
+    g.created_at = $now,
+    g.hit_count = 1
+ON MATCH SET
+    g.rule_text = $rule_text,
+    g.fix_instruction = $fix_instruction,
+    g.updated_at = $now,
+    g.hit_count = coalesce(g.hit_count, 1) + 1
 MERGE (step)-[:HAS_GUARDRAIL]->(g)
 WITH g
 OPTIONAL MATCH (ep:Episode {id: $episode_id})
@@ -361,7 +387,7 @@ sequenceDiagram
 
 ### Phase 5: Multi-Tenant Skill Isolation & Cross-Session Stress Benchmark `[COMPLETED]`
 
-> **Status:** ✅ **COMPLETED** (Verified across 100/100 tests on FalkorDB)
+> **Status:** ✅ **COMPLETED** (Verified across 104/104 tests on FalkorDB)
 
 #### Objective
 Verify that procedural skills and compiled guardrails remain strictly isolated across hardware tenant graphs (`mem_acme_payments_shared` vs `mem_nebula_cloud_shared`) and endure high-concurrency multi-agent race conditions without deadlock.
@@ -379,11 +405,12 @@ All procedural queries are cataloged in [`backend/app/core/cypher_catalog.py`](f
 
 | Query Constant | Description | Target Nodes & Relationships |
 | :--- | :--- | :--- |
-| `PROCEDURE_CREATE` | Initializes a unique procedure root node. | `MERGE (p:Procedure {id, name, trigger_description})` |
+| `PROCEDURE_CREATE` | Initializes or updates a unique procedure root node with MemRL utility and Bayesian priors. | `MERGE (p:Procedure {name}) ON CREATE SET ... ON MATCH SET ...` |
 | `ACTION_STEP_APPEND` | Appends an ordered step and dynamically establishes `[:FIRST_STEP]` or `[:NEXT_STEP]` in Cypher. | `(p)-[:FIRST_STEP]->(step)`<br>`(prev)-[:NEXT_STEP]->(step)` |
-| `PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS` | Hydrates procedure, ordered step list, and all attached guardrails. | `(proc)-[:FIRST_STEP\|NEXT_STEP*1..10]->(step)`<br>`(step)-[:HAS_GUARDRAIL]->(g:Guardrail)` |
-| `PROCEDURAL_GUARDRAIL_ATTACH` | Attaches a learned guardrail to a step and creates episode provenance. | `(step)-[:HAS_GUARDRAIL]->(g:Guardrail)`<br>`(g)-[:TRIGGERED_BY]->(ep:Episode)` |
-| `PROCEDURAL_OUTCOME_RECORD` | Atomically increments `success_count` or `fail_count` on a procedure node. | `SET p.success_count = coalesce(p.success_count, 0) + 1` |
+| `PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS` | Hydrates procedure, ordered step list, and all attached guardrails in a single deterministic row. | `(proc)-[:FIRST_STEP\|NEXT_STEP*1..15]->(step)`<br>`(step)-[:HAS_GUARDRAIL]->(g:Guardrail)` |
+| `PROCEDURAL_GUARDRAIL_ATTACH` | Attaches a learned guardrail by natural error signature and creates episode provenance. | `(step)-[:HAS_GUARDRAIL]->(g:Guardrail)`<br>`(g)-[:TRIGGERED_BY]->(ep:Episode)` |
+| `PROCEDURAL_OUTCOME_RECORD` | Atomically updates success/fail counters, Bayesian success rate, and MemRL TD utility score. | `SET p.bayesian_success_rate = ..., p.utility_score = ...` |
+| `PROCEDURAL_GUARDRAIL_RESET` | Detaches and deletes learned guardrails for a tenant or procedure for testing repeatability. | `MATCH (g:Guardrail) DETACH DELETE g` |
 
 ---
 
@@ -391,7 +418,7 @@ All procedural queries are cataloged in [`backend/app/core/cypher_catalog.py`](f
 
 | Risk ID | Potential Trap | Blast Radius | Engineered Mitigation |
 | :--- | :--- | :--- | :--- |
-| **P1** | **Unbound Step Chaining Variable Hop:** Using `(p)-[:NEXT_STEP*]->(step)` without depth bound. | Unbounded graph scan on dense graphs causing Redis timeout. | Constrained variable-length pattern to `*0..15` in `ACTION_STEP_APPEND` and `*1..10` in retrieval. |
+| **P1** | **Unbound Step Chaining Variable Hop:** Using `(p)-[:NEXT_STEP*]->(step)` without depth bound. | Unbounded graph scan on dense graphs causing Redis timeout. | Constrained variable-length pattern to `*0..15` in `ACTION_STEP_APPEND` and `*1..15` in retrieval. |
 | **P2** | **Orphan Step on Unregistered Procedure:** Calling `attach_guardrail` on a step that does not exist in FalkorDB. | `MATCH (step:ActionStep)` evaluates to 0 rows; guardrail is silently dropped. | Implemented `MERGE (step:ActionStep {id: $step_id})` in `PROCEDURAL_GUARDRAIL_ATTACH` so steps are created if absent. |
 | **P3** | **Deadlock on Concurrent Outcome Increments:** Multiple agents updating `success_count` on the same `:Procedure`. | Cypher transaction lock contention. | Used atomic single-property mutation: `SET p.success_count = coalesce(p.success_count, 0) + 1, p.updated_at = $now`. |
 | **P4** | **Cross-Session Guardrail Poisoning:** A transient network glitch compiles a permanent restrictive guardrail. | Agent permanently blocks valid tool parameters. | REST endpoint `POST /api/v1/memory/procedural/guardrail/reset` allows judges and operators to reset guardrails with 1 click. |
@@ -401,7 +428,7 @@ All procedural queries are cataloged in [`backend/app/core/cypher_catalog.py`](f
 
 ## 6. Falsifiable Verification Matrix (Test Suite)
 
-All 100 test scenarios across the repository are green:
+All 104 test scenarios across the repository are green:
 
 | Test Identifier | Component | Verification Scenario & Invariants | Pass Status |
 | :--- | :--- | :--- | :---: |
@@ -409,9 +436,13 @@ All 100 test scenarios across the repository are green:
 | **`TEST-PROC-GUARD-02`** | **Episode Provenance** | Attaching a guardrail with `episode_id` materializes `(g:Guardrail)-[:TRIGGERED_BY]->(ep:Episode)` in FalkorDB. | ✅ **PASSED** |
 | **`TEST-PROC-RETR-03`** | **Hydration** | `retrieve_procedure("Database_Migration")` returns ordered steps (order 1 followed by order 2) and all attached guardrails. | ✅ **PASSED** |
 | **`TEST-PROC-REFL-04`** | **Compiler** | `compile_guardrail_from_failure` compiles an error trace into a `:Guardrail` node with matching error signature. | ✅ **PASSED** |
-| **`TEST-PROC-OUTCOME-05`** | **MemRL Outcome** | `record_procedure_outcome(success=True)` increments `success_count` and updates `updated_at`. | ✅ **PASSED** |
+| **`TEST-PROC-OUTCOME-05`** | **MemRL Outcome** | `record_procedure_outcome` updates counters, Bayesian success rate, and MemRL utility score in pure Cypher. | ✅ **PASSED** |
+| **`TEST-PROC-AUDIT-01`** | **Grouping & Order** | Proves `ordered_steps` returns discrete steps without procedure node pollution and respects 1..$N$ ordinal order. | ✅ **PASSED** |
+| **`TEST-PROC-AUDIT-02`** | **Case Insensitivity** | Verifies retrieval matches on lowercase names (`database_migration`) and substring trigger intents (`cutover`). | ✅ **PASSED** |
+| **`TEST-PROC-AUDIT-04`** | **Natural Key Merge** | Verifies repeated guardrail compilation merges on `error_signature`, incrementing `hit_count` without duplicate nodes. | ✅ **PASSED** |
+| **`TEST-PROC-AUDIT-05`** | **Guardrail Reset** | Validates tenant-level guardrail reset deletes nodes and returns clean 0-guardrail state for judge repeatability. | ✅ **PASSED** |
 | **`TEST-ORCH-REFL-01`** | **Two-Turn Reflexion** | Turn 1 hits `ERR_NO_WAL_CHECKPOINT` $\to$ compiles `:Guardrail`. Turn 2 enforces WAL checkpoint on attempt #1 with 0 errors. | ✅ **PASSED** |
-| **`TEST-API-WORK-PROC-02`** | **REST Endpoints** | Validates HTTP 200 responses on all 11 new Working and Procedural REST endpoints. | ✅ **PASSED** |
+| **`TEST-API-WORK-PROC-02`** | **REST Endpoints** | Validates HTTP 200 responses on all Working and Procedural REST endpoints including reset and MemRL metrics. | ✅ **PASSED** |
 | **`TEST-WORK-PARALLEL-03`** | **Concurrency** | 10 concurrent agents racing to claim a single subtask results in exactly 1 claim winner and 9 rejections. | ✅ **PASSED** |
 
 ---
@@ -537,6 +568,33 @@ Procedural memory endpoints are exposed under prefix `/api/v1/memory/procedural`
   {
     "tenant_id": "acme-payments",
     "status": "SUCCESS",
+    "result": {
+      "success": true,
+      "procedure_name": "Database_Migration",
+      "success_count": 6,
+      "fail_count": 1,
+      "bayesian_success_rate": 0.778,
+      "utility_score": 0.68
+    },
     "updated": true
+  }
+  ```
+
+### 5. Reset Learned Guardrails
+- **Route:** `POST /api/v1/memory/procedural/guardrail/reset` (Alias: `POST /api/v1/memory/reset-guardrails`)
+- **Request Payload (Optional):**
+  ```json
+  {
+    "tenant_id": "acme-payments",
+    "procedure_name": "Database_Migration"
+  }
+  ```
+- **Response:**
+  ```json
+  {
+    "tenant_id": "acme-payments",
+    "status": "SUCCESS",
+    "deleted_count": 1,
+    "procedure_name": "Database_Migration"
   }
   ```

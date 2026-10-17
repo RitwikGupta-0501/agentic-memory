@@ -286,7 +286,7 @@ def test_api_working_and_procedural_endpoints(client, test_tenant):
     assert refl_compile_res.json()["status"] == "SUCCESS"
     assert refl_compile_res.json()["guardrail"]["episode_id"] == ep["id"]
 
-    # 12. POST /procedural/outcome
+    # 12. POST /procedural/outcome (Verifies MemRL metrics in response)
     outcome_res = client.post(
         "/api/v1/memory/procedural/outcome",
         json={"tenant_id": t_id, "procedure_name": "Canary_Rollout_Procedure", "success": True},
@@ -294,6 +294,26 @@ def test_api_working_and_procedural_endpoints(client, test_tenant):
     assert outcome_res.status_code == 200
     assert outcome_res.json()["status"] == "SUCCESS"
     assert outcome_res.json()["updated"] is True
+    assert "result" in outcome_res.json()
+    assert outcome_res.json()["result"]["bayesian_success_rate"] == 0.667
+    assert outcome_res.json()["result"]["utility_score"] == 0.6
+
+    # 13. POST /procedural/guardrail/reset (and alias /reset-guardrails)
+    reset_res = client.post(
+        "/api/v1/memory/procedural/guardrail/reset",
+        json={"tenant_id": t_id, "procedure_name": "Canary_Rollout_Procedure"},
+    )
+    assert reset_res.status_code == 200
+    assert reset_res.json()["status"] == "SUCCESS"
+    assert reset_res.json()["deleted_count"] >= 1
+
+    # Invariant: Guardrails cleared
+    ret_after_reset = client.post(
+        "/api/v1/memory/procedural/retrieve",
+        json={"tenant_id": t_id, "procedure_name": "Canary_Rollout_Procedure"},
+    )
+    assert ret_after_reset.status_code == 200
+    assert len(ret_after_reset.json()["procedure"]["guardrails"]) == 0
 
 
 @pytest.mark.asyncio

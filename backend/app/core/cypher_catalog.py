@@ -709,24 +709,36 @@ RETURN r
 # ==========================================
 
 PROCEDURE_CREATE = """
-MERGE (p:Procedure {
-    id: $procedure_id,
-    name: $name,
-    trigger_description: $trigger_description,
-    success_count: 0,
-    fail_count: 0
-})
+MERGE (p:Procedure {name: $name})
+ON CREATE SET
+    p.id = $procedure_id,
+    p.trigger_description = $trigger_description,
+    p.success_count = 0,
+    p.fail_count = 0,
+    p.bayesian_success_rate = 0.5,
+    p.utility_score = 0.5,
+    p.created_at = $now,
+    p.updated_at = $now
+ON MATCH SET
+    p.trigger_description = $trigger_description,
+    p.updated_at = $now
 RETURN p
 """
 
 ACTION_STEP_APPEND = """
 MATCH (p:Procedure {id: $procedure_id})
-MERGE (step:ActionStep {
-    id: $step_id,
-    step_order: $step_order,
-    tool_name: $tool_name,
-    param_schema: $param_schema
-})
+MERGE (step:ActionStep {id: $step_id})
+ON CREATE SET
+    step.step_order = $step_order,
+    step.tool_name = $tool_name,
+    step.param_schema = $param_schema,
+    step.created_at = $now
+ON MATCH SET
+    step.step_order = $step_order,
+    step.tool_name = $tool_name,
+    step.param_schema = $param_schema,
+    step.updated_at = $now
+WITH p, step
 FOREACH (_ IN CASE WHEN $step_order = 1 THEN [1] ELSE [] END |
     MERGE (p)-[:FIRST_STEP]->(step)
 )
@@ -741,21 +753,39 @@ RETURN step
 
 PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS = """
 MATCH (proc:Procedure)
-WHERE proc.name = $procedure_name OR proc.trigger_description CONTAINS $intent
-OPTIONAL MATCH path = (proc)-[:FIRST_STEP|NEXT_STEP*1..10]->(step:ActionStep)
+WHERE proc.name = $procedure_name 
+   OR toLower(proc.name) = toLower($procedure_name)
+   OR ($intent <> '' AND toLower(proc.trigger_description) CONTAINS toLower($intent))
+   OR ($procedure_name <> '' AND toLower(proc.trigger_description) CONTAINS toLower($procedure_name))
+WITH proc
+ORDER BY CASE 
+    WHEN proc.name = $procedure_name THEN 0
+    WHEN toLower(proc.name) = toLower($procedure_name) THEN 1
+    ELSE 2
+END ASC, coalesce(proc.utility_score, 0.5) DESC
+LIMIT 1
+OPTIONAL MATCH (proc)-[:FIRST_STEP|NEXT_STEP*1..15]->(step:ActionStep)
 OPTIONAL MATCH (step)-[:HAS_GUARDRAIL]->(g:Guardrail)
-RETURN proc, nodes(path) AS ordered_steps, collect(g) AS active_guardrails
+WITH proc, step, g ORDER BY step.step_order ASC
+RETURN proc,
+       collect(DISTINCT step) AS ordered_steps,
+       collect(DISTINCT g) AS active_guardrails
 """
 
 PROCEDURAL_GUARDRAIL_ATTACH = """
-MATCH (step:ActionStep {id: $step_id})
-MERGE (g:Guardrail {
-    id: $guardrail_id,
-    rule_text: $rule_text,
-    error_signature: $error_signature,
-    fix_instruction: $fix_instruction,
-    created_at: $now
-})
+MERGE (step:ActionStep {id: $step_id})
+MERGE (g:Guardrail {error_signature: $error_signature})
+ON CREATE SET
+    g.id = $guardrail_id,
+    g.rule_text = $rule_text,
+    g.fix_instruction = $fix_instruction,
+    g.created_at = $now,
+    g.hit_count = 1
+ON MATCH SET
+    g.rule_text = $rule_text,
+    g.fix_instruction = $fix_instruction,
+    g.updated_at = $now,
+    g.hit_count = coalesce(g.hit_count, 1) + 1
 MERGE (step)-[:HAS_GUARDRAIL]->(g)
 WITH g
 OPTIONAL MATCH (ep:Episode {id: $episode_id})
@@ -763,6 +793,25 @@ FOREACH (_ IN CASE WHEN ep IS NOT NULL AND $episode_id IS NOT NULL THEN [1] ELSE
     MERGE (g)-[:TRIGGERED_BY]->(ep)
 )
 RETURN g
+"""
+
+PROCEDURAL_OUTCOME_RECORD = """
+MATCH (p:Procedure)
+WHERE p.name = $procedure_name OR toLower(p.name) = toLower($procedure_name)
+WITH p,
+     coalesce(p.success_count, 0) + CASE WHEN $success THEN 1 ELSE 0 END AS new_succ,
+     coalesce(p.fail_count, 0) + CASE WHEN $success THEN 0 ELSE 1 END AS new_fail,
+     coalesce(p.utility_score, 0.5) AS old_q,
+     CASE WHEN $success THEN 1.0 ELSE 0.0 END AS reward
+SET p.success_count = new_succ,
+    p.fail_count = new_fail,
+    p.bayesian_success_rate = round(((toFloat(new_succ) + 1.0) / (toFloat(new_succ + new_fail) + 2.0)) * 1000.0) / 1000.0,
+    p.utility_score = round((old_q + 0.2 * (reward - old_q)) * 1000.0) / 1000.0,
+    p.updated_at = $now
+RETURN p.success_count AS success_count,
+       p.fail_count AS fail_count,
+       p.bayesian_success_rate AS bayesian_success_rate,
+       p.utility_score AS utility_score
 """
 
 # ==========================================
@@ -847,6 +896,7 @@ CYPHER_CATALOG: Dict[str, str] = {
     "ACTION_STEP_APPEND": ACTION_STEP_APPEND,
     "PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS": PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS,
     "PROCEDURAL_GUARDRAIL_ATTACH": PROCEDURAL_GUARDRAIL_ATTACH,
+    "PROCEDURAL_OUTCOME_RECORD": PROCEDURAL_OUTCOME_RECORD,
     "CONSOLIDATION_RETENTION_QUERY": CONSOLIDATION_RETENTION_QUERY,
     "CONSOLIDATION_INSIGHT_CREATE": CONSOLIDATION_INSIGHT_CREATE,
     "VISUALIZE_ALL_GRAPH": VISUALIZE_ALL_GRAPH,
