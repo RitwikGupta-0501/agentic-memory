@@ -11,6 +11,8 @@ from app.core.falkor_client import falkor_router
 from app.memory.episodic import episodic_memory
 from app.memory.importance import importance_scorer
 from app.memory.semantic import semantic_memory, EntityTriple, FactExtractionResult
+from app.memory.working import working_memory, SubTaskSpec
+from app.memory.procedural import procedural_memory, ActionStepSpec
 
 router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
 
@@ -640,6 +642,332 @@ def get_cytoscape_time_travel_endpoint(
         "as_of": as_of if as_of is not None else time.time(),
         "elements": elements,
     }
+
+
+# ==========================================
+# Working Memory (Layer 3A) REST Endpoints
+# ==========================================
+
+class SubTaskSpecInput(BaseModel):
+    id: Optional[str] = None
+    title: str = Field(..., min_length=1)
+    description: str = ""
+    depends_on: List[str] = Field(default_factory=list)
+
+
+class WorkingDagCreateRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    goal: str = Field(..., min_length=1)
+    subtasks: List[SubTaskSpecInput]
+    task_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+class WorkingClaimRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    task_id: str = Field(..., min_length=1)
+    agent_id: str = Field(..., min_length=1)
+    user_id: Optional[str] = None
+
+
+class WorkingCompleteRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    subtask_id: str = Field(..., min_length=1)
+    agent_id: str = Field(..., min_length=1)
+    result_summary: str = ""
+    user_id: Optional[str] = None
+    reward: float = 1.0
+
+
+class WorkingFailRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    subtask_id: str = Field(..., min_length=1)
+    agent_id: str = Field(..., min_length=1)
+    error_message: str = Field(..., min_length=1)
+    user_id: Optional[str] = None
+
+
+class WorkingPinRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    subtask_id: str = Field(..., min_length=1)
+    target_id: str = Field(..., min_length=1)
+    reason: str = ""
+    user_id: Optional[str] = None
+
+
+@router.post("/working/dag")
+def create_working_task_dag_endpoint(req: WorkingDagCreateRequest) -> Dict[str, Any]:
+    """Initializes a coordinated multi-agent task DAG on the FalkorDB blackboard."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    subtask_specs = [
+        SubTaskSpec(
+            id=st.id or f"st_{uuid.uuid4().hex[:6]}",
+            title=st.title,
+            description=st.description,
+            depends_on=st.depends_on,
+        )
+        for st in req.subtasks
+    ]
+    dag_res = working_memory.initialize_task_dag(
+        tenant_id=t_id,
+        goal=req.goal,
+        subtasks=subtask_specs,
+        task_id=req.task_id,
+        user_id=req.user_id,
+    )
+    task_id = dag_res["task_id"] if isinstance(dag_res, dict) else dag_res
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "task_id": task_id,
+        "subtasks_count": len(subtask_specs),
+    }
+
+
+@router.get("/working/task/{task_id}")
+def get_working_task_endpoint(
+    task_id: str,
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    user_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Retrieves current blackboard DAG status and all subtask lock states."""
+    task_status = working_memory.get_task_status(tenant_id=tenant_id, task_id=task_id, user_id=user_id)
+    if not task_status:
+        return {"tenant_id": tenant_id, "status": "NOT_FOUND", "task": None}
+    return {
+        "tenant_id": tenant_id,
+        "status": "SUCCESS",
+        "task": task_status,
+    }
+
+
+@router.post("/working/claim")
+def claim_working_subtask_endpoint(req: WorkingClaimRequest) -> Dict[str, Any]:
+    """Atomically claims next pending subtask whose upstream dependencies are satisfied."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    claim = working_memory.claim_next_subtask(
+        tenant_id=t_id,
+        task_id=req.task_id,
+        agent_id=req.agent_id,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS" if claim else "NO_ELIGIBLE_SUBTASK",
+        "subtask": claim,
+    }
+
+
+@router.post("/working/complete")
+def complete_working_subtask_endpoint(req: WorkingCompleteRequest) -> Dict[str, Any]:
+    """Marks subtask complete and propagates MemRL utility score feedback to pinned context."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    success = working_memory.complete_subtask(
+        tenant_id=t_id,
+        subtask_id=req.subtask_id,
+        agent_id=req.agent_id,
+        result_summary=req.result_summary,
+        user_id=req.user_id,
+        reward=req.reward,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS" if success else "FAILED",
+        "subtask_id": req.subtask_id,
+    }
+
+
+@router.post("/working/fail")
+def fail_working_subtask_endpoint(req: WorkingFailRequest) -> Dict[str, Any]:
+    """Marks subtask failed and cascades BLOCKED status to all downstream dependent subtasks."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = working_memory.fail_subtask(
+        tenant_id=t_id,
+        subtask_id=req.subtask_id,
+        agent_id=req.agent_id,
+        error_message=req.error_message,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "result": res,
+    }
+
+
+@router.post("/working/pin")
+def pin_working_context_endpoint(req: WorkingPinRequest) -> Dict[str, Any]:
+    """Attaches a zero-copy [:PINNED_CONTEXT] pointer from a subtask to an Entity or Episode."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = working_memory.pin_context(
+        tenant_id=t_id,
+        subtask_id=req.subtask_id,
+        target_id=req.target_id,
+        reason=req.reason,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "subtask_id": req.subtask_id,
+        "target_id": req.target_id,
+        "pinned": res,
+    }
+
+
+# ==========================================
+# Procedural Memory (Layer 3B) REST Endpoints
+# ==========================================
+
+class ActionStepSpecInput(BaseModel):
+    id: Optional[str] = None
+    step_order: int
+    tool_name: str
+    param_schema: str = "{}"
+
+
+class ProcedureRegisterRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    name: str = Field(..., min_length=1)
+    trigger_description: str = Field(..., min_length=1)
+    steps: List[ActionStepSpecInput]
+    user_id: Optional[str] = None
+
+
+class ProcedureRetrieveRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    procedure_name: str = Field(..., min_length=1)
+    intent: Optional[str] = ""
+    user_id: Optional[str] = None
+
+
+class GuardrailAttachRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    step_id: str = Field(..., min_length=1)
+    rule_text: str = Field(..., min_length=1)
+    error_signature: str = Field(..., min_length=1)
+    fix_instruction: str = Field(..., min_length=1)
+    episode_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+class ReflexionCompileRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    step_id: str = Field(..., min_length=1)
+    error_signature: str = Field(..., min_length=1)
+    rule_text: str = Field(..., min_length=1)
+    fix_instruction: str = Field(..., min_length=1)
+    episode_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+class ProcedureOutcomeRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    procedure_name: str = Field(..., min_length=1)
+    success: bool
+    user_id: Optional[str] = None
+
+
+@router.post("/procedural/register")
+def register_procedure_endpoint(req: ProcedureRegisterRequest) -> Dict[str, Any]:
+    """Registers a reusable skill DAG with ordered action steps in FalkorDB."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    step_specs = [
+        ActionStepSpec(
+            id=s.id or f"step_{uuid.uuid4().hex[:6]}",
+            step_order=s.step_order,
+            tool_name=s.tool_name,
+            param_schema=s.param_schema,
+        )
+        for s in req.steps
+    ]
+    res = procedural_memory.register_procedure(
+        tenant_id=t_id,
+        name=req.name,
+        trigger_description=req.trigger_description,
+        steps=step_specs,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "procedure": res,
+    }
+
+
+@router.post("/procedural/retrieve")
+def retrieve_procedure_endpoint(req: ProcedureRetrieveRequest) -> Dict[str, Any]:
+    """Retrieves a skill DAG and all attached learned Guardrails."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = procedural_memory.retrieve_procedure(
+        tenant_id=t_id,
+        procedure_name=req.procedure_name,
+        intent=req.intent or "",
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS" if res else "NOT_FOUND",
+        "procedure": res,
+    }
+
+
+@router.post("/procedural/guardrail")
+def attach_guardrail_endpoint(req: GuardrailAttachRequest) -> Dict[str, Any]:
+    """Attaches a learned Guardrail to an ActionStep with optional Episode provenance link."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = procedural_memory.attach_guardrail(
+        tenant_id=t_id,
+        step_id=req.step_id,
+        rule_text=req.rule_text,
+        error_signature=req.error_signature,
+        fix_instruction=req.fix_instruction,
+        episode_id=req.episode_id,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "guardrail": res,
+    }
+
+
+@router.post("/procedural/compile-reflexion")
+def compile_reflexion_endpoint(req: ReflexionCompileRequest) -> Dict[str, Any]:
+    """Compiles an agent tool failure trace into a preventive Guardrail with [:TRIGGERED_BY] provenance."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    res = procedural_memory.compile_guardrail_from_failure(
+        tenant_id=t_id,
+        step_id=req.step_id,
+        error_signature=req.error_signature,
+        rule_text=req.rule_text,
+        fix_instruction=req.fix_instruction,
+        episode_id=req.episode_id,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "guardrail": res,
+    }
+
+
+@router.post("/procedural/outcome")
+def record_procedure_outcome_endpoint(req: ProcedureOutcomeRequest) -> Dict[str, Any]:
+    """Records reinforcement success or failure outcome counts for a Procedure."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    updated = procedural_memory.record_procedure_outcome(
+        tenant_id=t_id,
+        procedure_name=req.procedure_name,
+        success=req.success,
+        user_id=req.user_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS" if updated else "FAILED",
+        "updated": updated,
+    }
+
 
 
 

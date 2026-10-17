@@ -142,6 +142,7 @@ RETURN coalesce(m.id, m.name) AS id,
        m.access_count AS access_count
 """
 
+# DEPRECATED: Retained for backward compatibility; superseded by ATOMIC_EPISODE_APPEND
 EPISODE_INSERT_AND_CHAIN = """
 MATCH (last_ep:Episode {session_id: $session_id})
 WHERE NOT (last_ep)-[:NEXT_EPISODE]->()
@@ -169,6 +170,7 @@ CREATE (last_ep)-[:NEXT_EPISODE {latency_ms: $latency_ms}]->(new_ep)
 RETURN new_ep
 """
 
+# DEPRECATED: Retained for backward compatibility; superseded by ATOMIC_EPISODE_APPEND
 EPISODE_INSERT_ROOT = """
 MERGE (new_ep:Episode {id: $episode_id})
 ON CREATE SET
@@ -206,7 +208,12 @@ ORDER BY similarity_score DESC
 
 EPISODE_HYBRID_CANDIDATE_FETCH = """
 CALL db.idx.vector.queryNodes('Episode', 'embedding', $candidate_limit, vecf32($query_vec))
-YIELD node AS ep, score AS raw_score
+YIELD node AS ep, score AS distance
+WITH ep, CASE 
+    WHEN (1.0 - distance) < 0.0 THEN 0.0 
+    WHEN (1.0 - distance) > 1.0 THEN 1.0 
+    ELSE (1.0 - distance) 
+END AS raw_score
 WHERE coalesce(ep.archived, false) = false
   AND ($cross_session = true OR ep.session_id = $session_id)
 RETURN ep, raw_score
@@ -258,6 +265,7 @@ RETURN m
 # 2. SEMANTIC MEMORY & BI-TEMPORAL QUERIES (Priority 1B)
 # ==========================================
 
+# DEPRECATED: Retained for backward compatibility; superseded by SEMANTIC_PROVENANCE_UPSERT_AND_LINK
 BITEMPORAL_INVALIDATE_AND_UPSERT = """
 MATCH (s:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
 WHERE old_r.valid_to IS NULL AND old_o.name <> $new_object
@@ -319,6 +327,11 @@ ON CREATE SET
     s.updated_at = $now,
     s.embedding = CASE WHEN $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE NULL END
 ON MATCH SET
+    s.id = coalesce(s.id, $subject_id),
+    s.canonical_name = coalesce(s.canonical_name, $subject_canonical),
+    s.type = coalesce(s.type, $subject_type),
+    s.embedding = CASE WHEN s.embedding IS NULL AND $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE s.embedding END,
+    s.aliases = CASE WHEN $subject IN coalesce(s.aliases, []) THEN coalesce(s.aliases, []) ELSE coalesce(s.aliases, []) + $subject END,
     s.updated_at = $now
 
 // 3. Ensure Object Entity exists
@@ -332,6 +345,11 @@ ON CREATE SET
     o.updated_at = $now,
     o.embedding = CASE WHEN $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE NULL END
 ON MATCH SET
+    o.id = coalesce(o.id, $object_id),
+    o.canonical_name = coalesce(o.canonical_name, $object_canonical),
+    o.type = coalesce(o.type, $object_type),
+    o.embedding = CASE WHEN o.embedding IS NULL AND $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE o.embedding END,
+    o.aliases = CASE WHEN $object IN coalesce(o.aliases, []) THEN coalesce(o.aliases, []) ELSE coalesce(o.aliases, []) + $object END,
     o.updated_at = $now
 
 // 4. Upsert active bi-temporal edge (prevent parallel active duplicate edges)
@@ -391,6 +409,7 @@ ORDER BY similarity DESC
 SEMANTIC_ENTITY_FIND_BY_ALIAS = """
 MATCH (e:Entity)
 WHERE e.canonical_name = $slug
+   OR e.name = $raw_name
    OR $raw_name IN coalesce(e.aliases, [])
    OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) = toLower($raw_name))
    OR toLower(e.name) = toLower($raw_name)
@@ -515,6 +534,7 @@ collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
 
 
 
+# DEPRECATED: Retained for backward compatibility; superseded by HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION
 HIPPORAG_HYBRID_RETRIEVAL = """
 MATCH (seed:Entity)
 WHERE seed.name IN $seed_entities
@@ -543,6 +563,8 @@ WHERE (seed.name IN $seed_names OR seed.canonical_name IN $seed_names)
   AND coalesce(seed.created_at, 0.0) <= $as_of
 MATCH path = (seed)-[r:RELATES_TO*1..3]-(target:Entity)
 WHERE length(path) <= $max_hops
+  AND none(n IN nodes(path)[1..] WHERE n = seed)
+  AND none(idx IN range(0, length(path) - 2) WHERE nodes(path)[idx] = nodes(path)[idx + 2])
   AND all(node IN nodes(path) WHERE coalesce(node.created_at, 0.0) <= $as_of)
   AND all(edge IN relationships(path) WHERE 
       edge.valid_from <= $as_of 
@@ -614,14 +636,15 @@ WORKING_MEMORY_ATOMIC_CLAIM = """
 MATCH (t:TaskRun {id: $task_id})-[:HAS_SUBTASK]->(st:SubTask {status: 'PENDING'})
 WHERE NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'PENDING'})
   AND NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'IN_PROGRESS'})
+  AND NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'FAILED'})
+  AND NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'BLOCKED'})
 WITH st LIMIT 1
 SET st.status = 'IN_PROGRESS',
     st.locked_by = $agent_id,
-
     st.claimed_at = $now
 WITH st
 OPTIONAL MATCH (st)-[:DEPENDS_ON]->(parent:SubTask)-[:PINNED_CONTEXT]->(ctx)
-RETURN st, collect(ctx) AS inherited_context_nodes
+RETURN st, collect(DISTINCT ctx) AS inherited_context_nodes
 """
 
 WORKING_MEMORY_COMPLETE_SUBTASK = """
@@ -630,6 +653,39 @@ SET st.status = 'COMPLETED',
     st.completed_at = $now,
     st.result_summary = $result_summary
 RETURN st
+"""
+
+WORKING_MEMORY_FAIL_SUBTASK = """
+MATCH (st:SubTask {id: $subtask_id, locked_by: $agent_id})
+SET st.status = 'FAILED',
+    st.completed_at = $now,
+    st.error_message = $error_message
+WITH st
+OPTIONAL MATCH (downstream:SubTask)-[:DEPENDS_ON]->(st)
+WHERE downstream.status = 'PENDING'
+SET downstream.status = 'BLOCKED'
+RETURN st, count(downstream) AS blocked_count
+"""
+
+TASK_DAG_STATUS_QUERY = """
+MATCH (t:TaskRun {id: $task_id})-[:HAS_SUBTASK]->(st:SubTask)
+OPTIONAL MATCH (st)-[:DEPENDS_ON]->(dep:SubTask)
+OPTIONAL MATCH (st)-[:PINNED_CONTEXT]->(ctx)
+WITH t, st, collect(DISTINCT dep.id) AS dep_ids, count(DISTINCT ctx) AS pinned_count
+RETURN t.id AS task_id,
+       t.goal AS goal,
+       t.status AS task_status,
+       collect({
+           id: st.id,
+           title: st.title,
+           description: st.description,
+           status: st.status,
+           locked_by: st.locked_by,
+           error_message: st.error_message,
+           result_summary: st.result_summary,
+           dependencies: dep_ids,
+           pinned_count: pinned_count
+       }) AS subtasks
 """
 
 WORKING_MEMORY_PIN_CONTEXT = """
@@ -666,10 +722,14 @@ MERGE (step:ActionStep {
     tool_name: $tool_name,
     param_schema: $param_schema
 })
+FOREACH (_ IN CASE WHEN $step_order = 1 THEN [1] ELSE [] END |
+    MERGE (p)-[:FIRST_STEP]->(step)
+)
 WITH p, step
-OPTIONAL MATCH (p)-[:FIRST_STEP]->(first:ActionStep)
-FOREACH (_ IN CASE WHEN first IS NULL AND $step_order = 1 THEN [1] ELSE [] END |
-    CREATE (p)-[:FIRST_STEP]->(step)
+OPTIONAL MATCH (p)-[:FIRST_STEP|NEXT_STEP*0..15]->(prev:ActionStep)
+WHERE prev.step_order = $step_order - 1
+FOREACH (_ IN CASE WHEN prev IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (prev)-[:NEXT_STEP]->(step)
 )
 RETURN step
 """
@@ -692,6 +752,11 @@ MERGE (g:Guardrail {
     created_at: $now
 })
 MERGE (step)-[:HAS_GUARDRAIL]->(g)
+WITH g
+OPTIONAL MATCH (ep:Episode {id: $episode_id})
+FOREACH (_ IN CASE WHEN ep IS NOT NULL AND $episode_id IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (g)-[:TRIGGERED_BY]->(ep)
+)
 RETURN g
 """
 
@@ -770,6 +835,8 @@ CYPHER_CATALOG: Dict[str, str] = {
     "SUBTASK_ADD_DEPENDENCY": SUBTASK_ADD_DEPENDENCY,
     "WORKING_MEMORY_ATOMIC_CLAIM": WORKING_MEMORY_ATOMIC_CLAIM,
     "WORKING_MEMORY_COMPLETE_SUBTASK": WORKING_MEMORY_COMPLETE_SUBTASK,
+    "WORKING_MEMORY_FAIL_SUBTASK": WORKING_MEMORY_FAIL_SUBTASK,
+    "TASK_DAG_STATUS_QUERY": TASK_DAG_STATUS_QUERY,
     "WORKING_MEMORY_PIN_CONTEXT": WORKING_MEMORY_PIN_CONTEXT,
     "PROCEDURE_CREATE": PROCEDURE_CREATE,
     "ACTION_STEP_APPEND": ACTION_STEP_APPEND,

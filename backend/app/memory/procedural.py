@@ -32,11 +32,14 @@ class ProceduralMemoryManager:
         tenant_id: str,
         name: str,
         trigger_description: str,
-        steps: List[ActionStepSpec],
+        steps: List[Any],
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Creates a procedure node and its ordered action steps in FalkorDB."""
         proc_id = f"proc_{uuid.uuid4().hex[:6]}"
+        step_objs: List[ActionStepSpec] = [
+            s if isinstance(s, ActionStepSpec) else ActionStepSpec(**s) for s in steps
+        ]
 
         # 1. Create Procedure
         self.router.query(
@@ -51,7 +54,7 @@ class ProceduralMemoryManager:
         )
 
         # 2. Append Steps
-        for step in steps:
+        for step in step_objs:
             self.router.query(
                 ACTION_STEP_APPEND,
                 {
@@ -66,7 +69,7 @@ class ProceduralMemoryManager:
             )
 
         # 3. Chain consecutive steps with NEXT_STEP
-        sorted_steps = sorted(steps, key=lambda s: s.step_order)
+        sorted_steps = sorted(step_objs, key=lambda s: s.step_order)
         for i in range(len(sorted_steps) - 1):
             chain_query = """
             MATCH (s1:ActionStep {id: $id1})
@@ -83,7 +86,7 @@ class ProceduralMemoryManager:
         return {
             "procedure_id": proc_id,
             "name": name,
-            "steps_count": len(steps),
+            "steps_count": len(step_objs),
         }
 
     def retrieve_procedure(
@@ -148,9 +151,10 @@ class ProceduralMemoryManager:
         rule_text: str,
         error_signature: str,
         fix_instruction: str,
+        episode_id: Optional[str] = None,
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Reflexion hook: Attaches a Guardrail node to a step that encountered an operational failure."""
+        """Reflexion hook: Attaches a Guardrail node to a step that encountered an operational failure, linked to the failure Episode."""
         now = time.time()
         guardrail_id = f"gr_{uuid.uuid4().hex[:6]}"
 
@@ -162,6 +166,7 @@ class ProceduralMemoryManager:
                 "rule_text": rule_text,
                 "error_signature": error_signature,
                 "fix_instruction": fix_instruction,
+                "episode_id": episode_id,
                 "now": now,
             },
             tenant_id=tenant_id,
@@ -173,7 +178,48 @@ class ProceduralMemoryManager:
             "step_id": step_id,
             "rule_text": rule_text,
             "fix_instruction": fix_instruction,
+            "episode_id": episode_id,
         }
+
+    def compile_guardrail_from_failure(
+        self,
+        tenant_id: str,
+        step_id: str,
+        error_signature: str,
+        rule_text: str,
+        fix_instruction: str,
+        episode_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compiles an operational failure trace into an active preventive Guardrail with cross-layer provenance."""
+        return self.attach_guardrail(
+            tenant_id=tenant_id,
+            step_id=step_id,
+            rule_text=rule_text,
+            error_signature=error_signature,
+            fix_instruction=fix_instruction,
+            episode_id=episode_id,
+            user_id=user_id,
+        )
+
+    def record_procedure_outcome(
+        self,
+        tenant_id: str,
+        procedure_name: str,
+        success: bool,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """Increments success_count or fail_count on a Procedure node."""
+        field = "success_count" if success else "fail_count"
+        q = f"""
+        MATCH (p:Procedure)
+        WHERE p.name = $name
+        SET p.{field} = coalesce(p.{field}, 0) + 1,
+            p.updated_at = $now
+        RETURN p.{field} AS count
+        """
+        res = self.router.query(q, {"name": procedure_name, "now": time.time()}, tenant_id=tenant_id, user_id=user_id)
+        return bool(res and res.result_set)
 
 
 procedural_memory = ProceduralMemoryManager()
