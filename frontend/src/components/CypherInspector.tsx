@@ -9,6 +9,8 @@ interface CypherInspectorProps {
   setIncludeInvalidated: (val: boolean) => void;
   onTriggerConsolidation: () => void;
   isConsolidating: boolean;
+  onResetGuardrails?: () => void;
+  isResettingGuardrails?: boolean;
   lastCypherQuery: string;
 }
 
@@ -18,6 +20,8 @@ export default function CypherInspector({
   setIncludeInvalidated,
   onTriggerConsolidation,
   isConsolidating,
+  onResetGuardrails,
+  isResettingGuardrails = false,
   lastCypherQuery,
 }: CypherInspectorProps) {
   const [activeTab, setActiveTab] = useState<"cypher" | "node">("cypher");
@@ -88,6 +92,24 @@ export default function CypherInspector({
             <span>{isConsolidating ? "Consolidating..." : "Run Consolidation"}</span>
           </button>
         </div>
+
+        {/* Procedural Guardrail Reset */}
+        {onResetGuardrails && (
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5 text-slate-300">
+              <ShieldAlert className="w-3.5 h-3.5 text-purple-400" />
+              <span className="font-medium">Procedural Memory:</span>
+            </div>
+            <button
+              onClick={onResetGuardrails}
+              disabled={isResettingGuardrails}
+              className="flex items-center gap-1.5 bg-purple-950 border border-purple-800 hover:bg-purple-900 text-purple-300 px-2.5 py-1 rounded text-[11px] font-medium transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3 h-3 ${isResettingGuardrails ? "animate-spin" : ""}`} />
+              <span>{isResettingGuardrails ? "Resetting..." : "Clear Learned Guardrails"}</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Main Content Area */}

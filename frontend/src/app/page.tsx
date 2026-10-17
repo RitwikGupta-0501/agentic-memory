@@ -131,6 +131,35 @@ export default function Home() {
     }
   };
 
+  const [isResettingGuardrails, setIsResettingGuardrails] = useState(false);
+
+  // Clear Learned Guardrails for judge repeatability
+  const handleResetGuardrails = async () => {
+    setIsResettingGuardrails(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/v1/memory/reset-guardrails?tenant_id=${tenantId}`, {
+        method: "POST",
+      });
+      const data = await res.json();
+      setEvents((prev) => [
+        ...prev,
+        {
+          type: "procedural_event",
+          agent: "Procedural Memory",
+          phase: "guardrail_reset",
+          message: `Cleared ${data.deleted_count || 0} learned Guardrail(s) from FalkorDB. The next migration will encounter the domain trap again!`,
+          cypher: "MATCH (g:Guardrail) DETACH DELETE g",
+        },
+      ]);
+      setLastCypherQuery("MATCH (g:Guardrail) DETACH DELETE g RETURN count(g) AS deleted_count");
+      fetchGraph();
+    } catch (err) {
+      console.error("Failed to reset guardrails:", err);
+    } finally {
+      setIsResettingGuardrails(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#090d16]">
       {/* Top Bar: Multi-Tenant & Session Switcher */}
@@ -172,6 +201,8 @@ export default function Home() {
             setIncludeInvalidated={setIncludeInvalidated}
             onTriggerConsolidation={handleTriggerConsolidation}
             isConsolidating={isConsolidating}
+            onResetGuardrails={handleResetGuardrails}
+            isResettingGuardrails={isResettingGuardrails}
             lastCypherQuery={lastCypherQuery}
           />
         </section>
