@@ -245,6 +245,35 @@ class MultiAgentCoordinationEngine:
             user_id=user_id,
         )
 
+        if not proc_check:
+            # Register base procedure and steps if not present in this tenant graph
+            procedural_memory.register_procedure(
+                tenant_id=tenant_id,
+                name="Database_Migration",
+                trigger_description="Automated database migration and cutover",
+                steps=[
+                    {
+                        "id": "step_schema_val",
+                        "step_order": 1,
+                        "tool_name": "query_database_config",
+                        "param_schema": '{"db_name": "string"}',
+                    },
+                    {
+                        "id": "step_migration_exec",
+                        "step_order": 2,
+                        "tool_name": "run_database_migration",
+                        "param_schema": '{"source_db": "string", "target_db": "string", "require_wal_checkpoint": "boolean"}',
+                    },
+                ],
+                user_id=user_id,
+            )
+            proc_check = procedural_memory.retrieve_procedure(
+                tenant_id=tenant_id,
+                procedure_name="Database_Migration",
+                intent="migration cutover",
+                user_id=user_id,
+            )
+
         has_guardrail = False
         if proc_check and proc_check.get("guardrails"):
             has_guardrail = True
@@ -258,6 +287,12 @@ class MultiAgentCoordinationEngine:
                 "cypher": "CALL db.idx.vector.queryNodes('Procedure'...) MATCH (step)-[:HAS_GUARDRAIL]->(g)",
             }
             res = run_database_migration("PostgreSQL", "FalkorDB", require_wal_checkpoint=True)
+            procedural_memory.record_procedure_outcome(
+                tenant_id=tenant_id,
+                procedure_name="Database_Migration",
+                success=True,
+                user_id=user_id,
+            )
         else:
             yield {
                 "type": "agent_event",
@@ -277,18 +312,43 @@ class MultiAgentCoordinationEngine:
                     "message": f"Encountered domain trap ({res['error_signature']}). Compiling new (:Guardrail) into Procedural Memory!",
                     "cypher": "MERGE (step)-[:HAS_GUARDRAIL]->(:Guardrail {error_signature: 'ERR_NO_WAL_CHECKPOINT', ...})",
                 }
-                # Record the guardrail in FalkorDB
-                procedural_memory.attach_guardrail(
+                # 1. Log failure episode to Episodic Memory with high importance
+                err_msg = res.get("error_message") or res.get("message") or "Unknown error"
+                fail_ep = episodic_memory.record_episode(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    content=f"Tool failure in migration: {err_msg} (Error: {res.get('error_signature')})",
+                    role="tool",
+                    importance_score=0.90,
+                    user_id=user_id,
+                )
+                # 2. Record procedure failure outcome
+                procedural_memory.record_procedure_outcome(
+                    tenant_id=tenant_id,
+                    procedure_name="Database_Migration",
+                    success=False,
+                    user_id=user_id,
+                )
+                # 3. Compile guardrail grounded in the failure episode
+                procedural_memory.compile_guardrail_from_failure(
                     tenant_id=tenant_id,
                     step_id="step_migration_exec",
-                    rule_text="Always enforce require_wal_checkpoint=True during database migrations",
                     error_signature=res["error_signature"],
-                    fix_instruction="Set require_wal_checkpoint=True",
+                    rule_text="Always enforce require_wal_checkpoint=True during database migrations",
+                    fix_instruction="Set require_wal_checkpoint=True to avoid replication drift.",
+                    episode_id=fail_ep["id"],
                     user_id=user_id,
                 )
                 await asyncio.sleep(0.4)
-                # Retry with the compiled fix
+                # 4. Retry with the compiled fix
                 res = run_database_migration("PostgreSQL", "FalkorDB", require_wal_checkpoint=True)
+                if res["status"] == "SUCCESS":
+                    procedural_memory.record_procedure_outcome(
+                        tenant_id=tenant_id,
+                        procedure_name="Database_Migration",
+                        success=True,
+                        user_id=user_id,
+                    )
 
         working_memory.complete_subtask(
             tenant_id=tenant_id,

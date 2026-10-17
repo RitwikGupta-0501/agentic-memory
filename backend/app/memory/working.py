@@ -108,6 +108,7 @@ class WorkingMemoryManager:
 
         props = getattr(st_node, "properties", {})
         return {
+            "id": props.get("id"),
             "subtask_id": props.get("id"),
             "title": props.get("title"),
             "status": "IN_PROGRESS",
@@ -201,11 +202,13 @@ class WorkingMemoryManager:
         if not res or not res.result_set:
             return None
         row = res.result_set[0]
+        subtasks = row[3] or []
         return {
             "task_id": row[0],
             "goal": row[1],
             "status": row[2],
-            "subtasks": row[3] or [],
+            "subtask_count": len(subtasks),
+            "subtasks": subtasks,
         }
 
     def pin_context(

@@ -32,11 +32,14 @@ class ProceduralMemoryManager:
         tenant_id: str,
         name: str,
         trigger_description: str,
-        steps: List[ActionStepSpec],
+        steps: List[Any],
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Creates a procedure node and its ordered action steps in FalkorDB."""
         proc_id = f"proc_{uuid.uuid4().hex[:6]}"
+        step_objs: List[ActionStepSpec] = [
+            s if isinstance(s, ActionStepSpec) else ActionStepSpec(**s) for s in steps
+        ]
 
         # 1. Create Procedure
         self.router.query(
@@ -51,7 +54,7 @@ class ProceduralMemoryManager:
         )
 
         # 2. Append Steps
-        for step in steps:
+        for step in step_objs:
             self.router.query(
                 ACTION_STEP_APPEND,
                 {
@@ -66,7 +69,7 @@ class ProceduralMemoryManager:
             )
 
         # 3. Chain consecutive steps with NEXT_STEP
-        sorted_steps = sorted(steps, key=lambda s: s.step_order)
+        sorted_steps = sorted(step_objs, key=lambda s: s.step_order)
         for i in range(len(sorted_steps) - 1):
             chain_query = """
             MATCH (s1:ActionStep {id: $id1})
@@ -83,7 +86,7 @@ class ProceduralMemoryManager:
         return {
             "procedure_id": proc_id,
             "name": name,
-            "steps_count": len(steps),
+            "steps_count": len(step_objs),
         }
 
     def retrieve_procedure(
