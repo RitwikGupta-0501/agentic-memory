@@ -10,6 +10,7 @@ from app.core.cypher_catalog import (
     ACTION_STEP_APPEND,
     PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS,
     PROCEDURAL_GUARDRAIL_ATTACH,
+    PROCEDURAL_OUTCOME_RECORD,
 )
 from app.core.falkor_client import falkor_router
 
@@ -36,33 +37,42 @@ class ProceduralMemoryManager:
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Creates a procedure node and its ordered action steps in FalkorDB."""
+        now = time.time()
         proc_id = f"proc_{uuid.uuid4().hex[:6]}"
         step_objs: List[ActionStepSpec] = [
             s if isinstance(s, ActionStepSpec) else ActionStepSpec(**s) for s in steps
         ]
 
         # 1. Create Procedure
-        self.router.query(
+        proc_res = self.router.query(
             PROCEDURE_CREATE,
             {
                 "procedure_id": proc_id,
                 "name": name,
                 "trigger_description": trigger_description,
+                "now": now,
             },
             tenant_id=tenant_id,
             user_id=user_id,
         )
+
+        actual_proc_id = proc_id
+        if proc_res and proc_res.result_set and proc_res.result_set[0]:
+            p_node = proc_res.result_set[0][0]
+            if hasattr(p_node, "properties"):
+                actual_proc_id = p_node.properties.get("id", proc_id)
 
         # 2. Append Steps
         for step in step_objs:
             self.router.query(
                 ACTION_STEP_APPEND,
                 {
-                    "procedure_id": proc_id,
+                    "procedure_id": actual_proc_id,
                     "step_id": step.id,
                     "step_order": step.step_order,
                     "tool_name": step.tool_name,
                     "param_schema": step.param_schema,
+                    "now": now,
                 },
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -84,7 +94,7 @@ class ProceduralMemoryManager:
             )
 
         return {
-            "procedure_id": proc_id,
+            "procedure_id": actual_proc_id,
             "name": name,
             "steps_count": len(step_objs),
         }
@@ -99,50 +109,49 @@ class ProceduralMemoryManager:
         """Retrieves a skill DAG along with any attached Guardrails from past failures."""
         res = self.router.query(
             PROCEDURAL_RETRIEVAL_WITH_GUARDRAILS,
-            {"procedure_name": procedure_name, "intent": intent or procedure_name},
+            {"procedure_name": procedure_name, "intent": intent or ""},
             tenant_id=tenant_id,
             user_id=user_id,
         )
 
-        if not res or not res.result_set:
+        if not res or not res.result_set or not res.result_set[0]:
             return None
 
-        proc_props = {}
-        steps_map = {}
-        guardrails_map = {}
+        row = res.result_set[0]
+        proc_node = row[0]
+        if not proc_node:
+            return None
 
-        for row in res.result_set:
-            if not row:
-                continue
-            proc_node = row[0]
-            if proc_node and not proc_props:
-                proc_props = getattr(proc_node, "properties", {})
-
-            steps_nodes = row[1] if len(row) > 1 and row[1] else []
-            for s in steps_nodes:
-                if s:
-                    s_props = getattr(s, "properties", {})
-                    s_id = s_props.get("id")
-                    if s_id and s_id not in steps_map and s_id != proc_props.get("id"):
-                        steps_map[s_id] = s_props
-
-            guardrails_nodes = row[2] if len(row) > 2 and row[2] else []
-            for g in guardrails_nodes:
-                if g:
-                    g_props = getattr(g, "properties", {})
-                    g_id = g_props.get("id")
-                    if g_id and g_id not in guardrails_map:
-                        guardrails_map[g_id] = g_props
-
+        proc_props = getattr(proc_node, "properties", {})
         if not proc_props:
             return None
 
+        steps_map = {}
+        guardrails_map = {}
+
+        steps_nodes = row[1] if len(row) > 1 and row[1] else []
+        for s in steps_nodes:
+            if s:
+                s_props = getattr(s, "properties", {})
+                s_id = s_props.get("id")
+                if s_id and s_id not in steps_map:
+                    steps_map[s_id] = s_props
+
+        guardrails_nodes = row[2] if len(row) > 2 and row[2] else []
+        for g in guardrails_nodes:
+            if g:
+                g_props = getattr(g, "properties", {})
+                g_sig = g_props.get("error_signature") or g_props.get("id")
+                if g_sig and g_sig not in guardrails_map:
+                    guardrails_map[g_sig] = g_props
+
+        ordered_steps = sorted(steps_map.values(), key=lambda s: s.get("step_order", 0))
+
         return {
             "procedure": proc_props,
-            "steps": list(steps_map.values()),
+            "steps": ordered_steps,
             "guardrails": list(guardrails_map.values()),
         }
-
 
     def attach_guardrail(
         self,
@@ -158,7 +167,7 @@ class ProceduralMemoryManager:
         now = time.time()
         guardrail_id = f"gr_{uuid.uuid4().hex[:6]}"
 
-        self.router.query(
+        res = self.router.query(
             PROCEDURAL_GUARDRAIL_ATTACH,
             {
                 "step_id": step_id,
@@ -173,10 +182,16 @@ class ProceduralMemoryManager:
             user_id=user_id,
         )
 
+        actual_gr_id = guardrail_id
+        if res and res.result_set and res.result_set[0] and res.result_set[0][0]:
+            g_props = getattr(res.result_set[0][0], "properties", {})
+            actual_gr_id = g_props.get("id", guardrail_id)
+
         return {
-            "guardrail_id": guardrail_id,
+            "guardrail_id": actual_gr_id,
             "step_id": step_id,
             "rule_text": rule_text,
+            "error_signature": error_signature,
             "fix_instruction": fix_instruction,
             "episode_id": episode_id,
         }
@@ -208,18 +223,50 @@ class ProceduralMemoryManager:
         procedure_name: str,
         success: bool,
         user_id: Optional[str] = None,
-    ) -> bool:
-        """Increments success_count or fail_count on a Procedure node."""
-        field = "success_count" if success else "fail_count"
-        q = f"""
-        MATCH (p:Procedure)
-        WHERE p.name = $name
-        SET p.{field} = coalesce(p.{field}, 0) + 1,
-            p.updated_at = $now
-        RETURN p.{field} AS count
-        """
-        res = self.router.query(q, {"name": procedure_name, "now": time.time()}, tenant_id=tenant_id, user_id=user_id)
-        return bool(res and res.result_set)
+    ) -> Dict[str, Any]:
+        """Records reinforcement success or failure outcome counts, updating Bayesian success rate and MemRL utility score."""
+        now = time.time()
+        res = self.router.query(
+            PROCEDURAL_OUTCOME_RECORD,
+            {
+                "procedure_name": procedure_name,
+                "success": success,
+                "now": now,
+            },
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if res and res.result_set and res.result_set[0]:
+            row = res.result_set[0]
+            return {
+                "success": True,
+                "procedure_name": procedure_name,
+                "success_count": row[0],
+                "fail_count": row[1],
+                "bayesian_success_rate": row[2],
+                "utility_score": row[3],
+            }
+        return {"success": False, "procedure_name": procedure_name}
+
+    def reset_guardrails(
+        self,
+        tenant_id: str,
+        procedure_name: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """Detaches and deletes learned Guardrails for a tenant or specific procedure."""
+        if procedure_name:
+            q = """
+            MATCH (p:Procedure)-[:FIRST_STEP|NEXT_STEP*1..15]->(s:ActionStep)-[:HAS_GUARDRAIL]->(g:Guardrail)
+            WHERE p.name = $procedure_name OR toLower(p.name) = toLower($procedure_name)
+            DETACH DELETE g
+            RETURN count(g) AS deleted_count
+            """
+            res = self.router.query(q, {"procedure_name": procedure_name}, tenant_id=tenant_id, user_id=user_id)
+        else:
+            q = "MATCH (g:Guardrail) DETACH DELETE g RETURN count(g) AS deleted_count"
+            res = self.router.query(q, tenant_id=tenant_id, user_id=user_id)
+        return res.result_set[0][0] if res and res.result_set and res.result_set[0] else 0
 
 
 procedural_memory = ProceduralMemoryManager()

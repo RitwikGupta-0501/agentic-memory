@@ -956,16 +956,47 @@ def compile_reflexion_endpoint(req: ReflexionCompileRequest) -> Dict[str, Any]:
 def record_procedure_outcome_endpoint(req: ProcedureOutcomeRequest) -> Dict[str, Any]:
     """Records reinforcement success or failure outcome counts for a Procedure."""
     t_id = req.tenant_id or settings.default_tenant_id
-    updated = procedural_memory.record_procedure_outcome(
+    res = procedural_memory.record_procedure_outcome(
         tenant_id=t_id,
         procedure_name=req.procedure_name,
         success=req.success,
         user_id=req.user_id,
     )
+    is_success = bool(res.get("success", False)) if isinstance(res, dict) else bool(res)
     return {
         "tenant_id": t_id,
-        "status": "SUCCESS" if updated else "FAILED",
-        "updated": updated,
+        "status": "SUCCESS" if is_success else "FAILED",
+        "result": res,
+        "updated": is_success,
+    }
+
+
+class GuardrailResetRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    procedure_name: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+@router.post("/procedural/guardrail/reset")
+@router.post("/reset-guardrails")
+def reset_guardrails_endpoint(
+    req: Optional[GuardrailResetRequest] = None,
+    tenant_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Resets/clears learned Guardrail nodes for testing and judge repeatability."""
+    t_id = (req.tenant_id if req and req.tenant_id else None) or tenant_id or settings.default_tenant_id
+    proc_name = req.procedure_name if req else None
+    u_id = req.user_id if req else None
+    deleted_count = procedural_memory.reset_guardrails(
+        tenant_id=t_id,
+        procedure_name=proc_name,
+        user_id=u_id,
+    )
+    return {
+        "tenant_id": t_id,
+        "status": "SUCCESS",
+        "deleted_count": deleted_count,
+        "procedure_name": proc_name,
     }
 
 
