@@ -614,9 +614,12 @@ class SemanticMemoryManager:
         if res and res.result_set:
             row = res.result_set[0]
             raw_rels = row[2] or []
-            clean_rels = [r for r in raw_rels if r and r.get("target") is not None]
+            clean_rels = [
+                r for r in raw_rels
+                if r is not None and isinstance(r, dict) and r.get("target") is not None and r.get("source") is not None
+            ]
             raw_neighbors = row[3] or []
-            clean_neighbors = [n for n in raw_neighbors if n is not None]
+            clean_neighbors = [n for n in raw_neighbors if n is not None and str(n).strip()]
             return {
                 "seed": row[0],
                 "seed_type": row[1],
@@ -662,7 +665,7 @@ class SemanticMemoryManager:
                         }
                     })
             for e in raw_edges or []:
-                if e and e.get("target") is not None:
+                if e is not None and isinstance(e, dict) and e.get("target") is not None and e.get("source") is not None:
                     is_active = e.get("status") == "ACTIVE"
                     elements["edges"].append({
                         "data": {

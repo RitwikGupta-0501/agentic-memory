@@ -25,7 +25,8 @@ WITH s
 OPTIONAL MATCH (parent:Session {id: $parent_session_id})
 WHERE $parent_session_id IS NOT NULL AND parent.id <> s.id
 FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (s)-[:PARENT_SESSION {linked_at: $now}]->(parent)
+    MERGE (s)-[p_rel:PARENT_SESSION]->(parent)
+    ON CREATE SET p_rel.linked_at = $now
 )
 RETURN s
 """
@@ -42,7 +43,8 @@ WITH s
 OPTIONAL MATCH (parent:Session {id: $parent_session_id})
 WHERE $parent_session_id IS NOT NULL AND parent.id <> s.id
 FOREACH (_ IN CASE WHEN parent IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (s)-[:PARENT_SESSION]->(parent)
+    MERGE (s)-[p_rel:PARENT_SESSION]->(parent)
+    ON CREATE SET p_rel.linked_at = $timestamp
 )
 WITH s
 OPTIONAL MATCH (s)-[old_tail_rel:SESSION_TAIL]->(prev_ep:Episode)
@@ -85,7 +87,7 @@ RETURN new_ep.id AS episode_id, prev_ep.id AS previous_episode_id, s.episode_cou
 MULTI_SESSION_LINEAGE_QUERY = """
 MATCH (curr:Session {id: $session_id})
 OPTIONAL MATCH path = (curr)-[:PARENT_SESSION*0..5]->(anc:Session)
-WITH anc ORDER BY anc.created_at ASC
+WITH DISTINCT anc ORDER BY anc.created_at ASC
 OPTIONAL MATCH (anc)-[:SESSION_HEAD]->(head:Episode)
 OPTIONAL MATCH (anc)-[:SESSION_TAIL]->(tail:Episode)
 RETURN anc.id AS session_id,
@@ -356,12 +358,13 @@ ON MATCH SET
 WITH s, o, invalidated_count, invalidated_objects
 OPTIONAL MATCH (s)-[existing_r:RELATES_TO {predicate: $predicate}]->(o)
 WHERE existing_r.valid_to IS NULL
+WITH s, o, invalidated_count, invalidated_objects, existing_r, existing_r.valid_from AS preserved_valid_from
 DELETE existing_r
 CREATE (s)-[new_r:RELATES_TO {
     predicate: $predicate,
     cardinality: $cardinality,
     confidence: $confidence,
-    valid_from: coalesce(existing_r.valid_from, $now),
+    valid_from: coalesce(preserved_valid_from, $now),
     valid_to: NULL,
     transaction_from: $now,
     source_episode: $episode_id
@@ -489,7 +492,7 @@ WHERE r.valid_from <= $as_of
   AND (r.valid_to IS NULL OR r.valid_to > $as_of)
 RETURN seed.name AS seed,
        seed.type AS seed_type,
-       collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
+       [rel IN collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
            source: startNode(r).name,
            predicate: r.predicate,
            target: endNode(r).name,
@@ -497,8 +500,8 @@ RETURN seed.name AS seed,
            valid_from: r.valid_from,
            valid_to: r.valid_to,
            status: CASE WHEN r.valid_to IS NULL THEN 'ACTIVE' ELSE 'SUPERSEDED' END
-       } ELSE NULL END) AS relationships,
-       collect(DISTINCT CASE WHEN neighbor IS NOT NULL THEN neighbor.name ELSE NULL END) AS neighbors
+       } ELSE NULL END) WHERE rel IS NOT NULL] AS relationships,
+       [nb IN collect(DISTINCT CASE WHEN neighbor IS NOT NULL THEN neighbor.name ELSE NULL END) WHERE nb IS NOT NULL] AS neighbors
 """
 
 SEMANTIC_CYTOSCAPE_TIME_TRAVEL = """
@@ -517,7 +520,7 @@ RETURN collect(DISTINCT {
     type: n.type,
     created_at: n.created_at
 }) AS nodes,
-collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
+[e IN collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
     id: id(r),
     source: n.name,
     target: m.name,
@@ -529,7 +532,7 @@ collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
         WHEN r.valid_to IS NULL OR r.valid_to > $as_of THEN 'ACTIVE'
         ELSE 'INVALIDATED'
     END
-} ELSE NULL END) AS edges
+} ELSE NULL END) WHERE e IS NOT NULL] AS edges
 """
 
 
@@ -586,9 +589,11 @@ MATCH (e)-[r:DERIVED_FROM|MENTIONED_IN]->(ep:Episode)
 WHERE coalesce(ep.archived, false) = false
   AND coalesce(ep.timestamp, r.timestamp, 0.0) <= $as_of
 OPTIONAL MATCH (s:Entity)-[old_rel:RELATES_TO {source_episode: ep.id}]->(t:Entity)
-WHERE old_rel.valid_to IS NOT NULL AND old_rel.valid_to <= $as_of
-WITH e, r, ep, count(old_rel) AS invalidated_count
-WHERE invalidated_count = 0
+WHERE (s = e OR t = e) AND old_rel.valid_to IS NOT NULL AND old_rel.valid_to <= $as_of
+OPTIONAL MATCH (s2:Entity)-[act_rel:RELATES_TO {source_episode: ep.id}]->(t2:Entity)
+WHERE (s2 = e OR t2 = e) AND act_rel.valid_from <= $as_of AND (act_rel.valid_to IS NULL OR act_rel.valid_to > $as_of)
+WITH e, r, ep, count(old_rel) AS invalidated_count, count(act_rel) AS active_count
+WHERE invalidated_count = 0 OR active_count > 0
 RETURN e.name AS entity,
        type(r) AS link_type,
        ep.id AS episode_id,
@@ -795,7 +800,7 @@ MATCH (n)
 WHERE NOT n:GraphMetadata
 OPTIONAL MATCH (n)-[r]->(m)
 RETURN collect(DISTINCT n) AS nodes,
-collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
+[e IN collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
     id: id(r),
     source: id(n),
     target: id(m),
@@ -804,7 +809,7 @@ collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
     valid_to: r.valid_to,
     predicate: r.predicate,
     status: r.status
-} ELSE NULL END) AS edges
+} ELSE NULL END) WHERE e IS NOT NULL] AS edges
 """
 
 VISUALIZE_ACTIVE_GRAPH = """
@@ -813,7 +818,7 @@ WHERE NOT n:GraphMetadata
 OPTIONAL MATCH (n)-[r]->(m)
 WHERE r.valid_to IS NULL
 RETURN collect(DISTINCT n) AS nodes,
-collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
+[e IN collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
     id: id(r),
     source: id(n),
     target: id(m),
@@ -822,7 +827,7 @@ collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
     valid_to: r.valid_to,
     predicate: r.predicate,
     status: r.status
-} ELSE NULL END) AS edges
+} ELSE NULL END) WHERE e IS NOT NULL] AS edges
 """
 
 CYPHER_CATALOG: Dict[str, str] = {
