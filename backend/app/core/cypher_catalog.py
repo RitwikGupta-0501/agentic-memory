@@ -722,10 +722,14 @@ MERGE (step:ActionStep {
     tool_name: $tool_name,
     param_schema: $param_schema
 })
+FOREACH (_ IN CASE WHEN $step_order = 1 THEN [1] ELSE [] END |
+    MERGE (p)-[:FIRST_STEP]->(step)
+)
 WITH p, step
-OPTIONAL MATCH (p)-[:FIRST_STEP]->(first:ActionStep)
-FOREACH (_ IN CASE WHEN first IS NULL AND $step_order = 1 THEN [1] ELSE [] END |
-    CREATE (p)-[:FIRST_STEP]->(step)
+OPTIONAL MATCH (p)-[:FIRST_STEP|NEXT_STEP*0..15]->(prev:ActionStep)
+WHERE prev.step_order = $step_order - 1
+FOREACH (_ IN CASE WHEN prev IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (prev)-[:NEXT_STEP]->(step)
 )
 RETURN step
 """
@@ -748,6 +752,11 @@ MERGE (g:Guardrail {
     created_at: $now
 })
 MERGE (step)-[:HAS_GUARDRAIL]->(g)
+WITH g
+OPTIONAL MATCH (ep:Episode {id: $episode_id})
+FOREACH (_ IN CASE WHEN ep IS NOT NULL AND $episode_id IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (g)-[:TRIGGERED_BY]->(ep)
+)
 RETURN g
 """
 
