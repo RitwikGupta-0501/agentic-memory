@@ -206,7 +206,12 @@ ORDER BY similarity_score DESC
 
 EPISODE_HYBRID_CANDIDATE_FETCH = """
 CALL db.idx.vector.queryNodes('Episode', 'embedding', $candidate_limit, vecf32($query_vec))
-YIELD node AS ep, score AS raw_score
+YIELD node AS ep, score AS distance
+WITH ep, CASE 
+    WHEN (1.0 - distance) < 0.0 THEN 0.0 
+    WHEN (1.0 - distance) > 1.0 THEN 1.0 
+    ELSE (1.0 - distance) 
+END AS raw_score
 WHERE coalesce(ep.archived, false) = false
   AND ($cross_session = true OR ep.session_id = $session_id)
 RETURN ep, raw_score
@@ -543,6 +548,8 @@ WHERE (seed.name IN $seed_names OR seed.canonical_name IN $seed_names)
   AND coalesce(seed.created_at, 0.0) <= $as_of
 MATCH path = (seed)-[r:RELATES_TO*1..3]-(target:Entity)
 WHERE length(path) <= $max_hops
+  AND none(n IN nodes(path)[1..] WHERE n = seed)
+  AND none(idx IN range(0, length(path) - 2) WHERE nodes(path)[idx] = nodes(path)[idx + 2])
   AND all(node IN nodes(path) WHERE coalesce(node.created_at, 0.0) <= $as_of)
   AND all(edge IN relationships(path) WHERE 
       edge.valid_from <= $as_of 

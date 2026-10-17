@@ -390,8 +390,8 @@ class EpisodicMemoryManager:
             if not props:
                 continue
 
-            # 1. Relevance: normalize raw distance to cosine similarity [0.0, 1.0]
-            relevance = max(0.0, min(1.0, 1.0 - raw_score))
+            # 1. Relevance: raw_score is already standardized cosine similarity [0.0, 1.0]
+            relevance = max(0.0, min(1.0, raw_score))
 
             # vCache decision boundary
             vcache_tau = float(props.get("vcache_threshold", 0.75))
