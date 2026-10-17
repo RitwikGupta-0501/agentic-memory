@@ -8,8 +8,6 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.cypher_catalog import (
-    BITEMPORAL_INVALIDATE_AND_UPSERT,
-    HIPPORAG_HYBRID_RETRIEVAL,
     HIPPORAG_SEED_VECTOR_SEARCH,
     HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION,
     HIPPORAG_EPISODE_GROUNDING_EXPANSION,

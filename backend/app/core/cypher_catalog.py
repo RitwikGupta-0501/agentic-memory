@@ -142,6 +142,7 @@ RETURN coalesce(m.id, m.name) AS id,
        m.access_count AS access_count
 """
 
+# DEPRECATED: Retained for backward compatibility; superseded by ATOMIC_EPISODE_APPEND
 EPISODE_INSERT_AND_CHAIN = """
 MATCH (last_ep:Episode {session_id: $session_id})
 WHERE NOT (last_ep)-[:NEXT_EPISODE]->()
@@ -169,6 +170,7 @@ CREATE (last_ep)-[:NEXT_EPISODE {latency_ms: $latency_ms}]->(new_ep)
 RETURN new_ep
 """
 
+# DEPRECATED: Retained for backward compatibility; superseded by ATOMIC_EPISODE_APPEND
 EPISODE_INSERT_ROOT = """
 MERGE (new_ep:Episode {id: $episode_id})
 ON CREATE SET
@@ -263,6 +265,7 @@ RETURN m
 # 2. SEMANTIC MEMORY & BI-TEMPORAL QUERIES (Priority 1B)
 # ==========================================
 
+# DEPRECATED: Retained for backward compatibility; superseded by SEMANTIC_PROVENANCE_UPSERT_AND_LINK
 BITEMPORAL_INVALIDATE_AND_UPSERT = """
 MATCH (s:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
 WHERE old_r.valid_to IS NULL AND old_o.name <> $new_object
@@ -324,6 +327,11 @@ ON CREATE SET
     s.updated_at = $now,
     s.embedding = CASE WHEN $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE NULL END
 ON MATCH SET
+    s.id = coalesce(s.id, $subject_id),
+    s.canonical_name = coalesce(s.canonical_name, $subject_canonical),
+    s.type = coalesce(s.type, $subject_type),
+    s.embedding = CASE WHEN s.embedding IS NULL AND $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE s.embedding END,
+    s.aliases = CASE WHEN $subject IN coalesce(s.aliases, []) THEN coalesce(s.aliases, []) ELSE coalesce(s.aliases, []) + $subject END,
     s.updated_at = $now
 
 // 3. Ensure Object Entity exists
@@ -337,6 +345,11 @@ ON CREATE SET
     o.updated_at = $now,
     o.embedding = CASE WHEN $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE NULL END
 ON MATCH SET
+    o.id = coalesce(o.id, $object_id),
+    o.canonical_name = coalesce(o.canonical_name, $object_canonical),
+    o.type = coalesce(o.type, $object_type),
+    o.embedding = CASE WHEN o.embedding IS NULL AND $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE o.embedding END,
+    o.aliases = CASE WHEN $object IN coalesce(o.aliases, []) THEN coalesce(o.aliases, []) ELSE coalesce(o.aliases, []) + $object END,
     o.updated_at = $now
 
 // 4. Upsert active bi-temporal edge (prevent parallel active duplicate edges)
@@ -396,6 +409,7 @@ ORDER BY similarity DESC
 SEMANTIC_ENTITY_FIND_BY_ALIAS = """
 MATCH (e:Entity)
 WHERE e.canonical_name = $slug
+   OR e.name = $raw_name
    OR $raw_name IN coalesce(e.aliases, [])
    OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) = toLower($raw_name))
    OR toLower(e.name) = toLower($raw_name)
@@ -520,6 +534,7 @@ collect(DISTINCT CASE WHEN r IS NOT NULL THEN {
 
 
 
+# DEPRECATED: Retained for backward compatibility; superseded by HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION
 HIPPORAG_HYBRID_RETRIEVAL = """
 MATCH (seed:Entity)
 WHERE seed.name IN $seed_entities
