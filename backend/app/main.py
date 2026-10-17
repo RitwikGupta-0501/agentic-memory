@@ -1,5 +1,6 @@
 """Main FastAPI entrypoint for AegisGraph backend."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict
@@ -33,8 +34,8 @@ async def lifespan(app: FastAPI):
             res = falkor_router.query(test_query, tenant_id=settings.default_tenant_id)
             count = res.result_set[0][0] if res and res.result_set else 0
             if count == 0:
-                logger.info("Default tenant graph is empty. Pre-seeding demo tenants...")
-                seed_all_tenants()
+                logger.info("Default tenant graph is empty. Pre-seeding demo tenants in background thread...")
+                await asyncio.to_thread(seed_all_tenants)
         except Exception as e:
             logger.warning(f"Could not verify initial seed state: {e}")
     else:
