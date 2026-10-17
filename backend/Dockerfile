@@ -24,6 +24,12 @@ RUN uv pip install --system -e ".[dev]"
 # Copy application code
 COPY . /app/
 
+# Create non-root user with UID 1000 for Hugging Face Spaces security
+RUN useradd -m -u 1000 user && chown -R user:user /app
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
+
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

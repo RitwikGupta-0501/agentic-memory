@@ -1,3 +1,13 @@
+---
+title: AegisGraph Cognitive Engine
+emoji: 🧠
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 8000
+pinned: false
+---
+
 # AegisGraph Backend
 
 FastAPI, LangChain, LangGraph, and FalkorDB-powered 4-Tier Cognitive Graph Memory Engine.
