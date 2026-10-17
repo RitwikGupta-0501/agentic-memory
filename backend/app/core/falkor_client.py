@@ -9,24 +9,53 @@ logger = logging.getLogger("aegis.falkor")
 
 
 class TenantGraphRouter:
-    """Manages multi-tenant graph isolation and OpenCypher execution."""
+    """Manages multi-tenant graph isolation and OpenCypher execution across local and FalkorDB Cloud."""
 
-    def __init__(self, host: str = None, port: int = None, password: str = None):
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        password: Optional[str] = None,
+        username: Optional[str] = None,
+        ssl: Optional[bool] = None,
+        ssl_cert_reqs: Optional[str] = None,
+    ):
+        self.url = url or settings.falkordb_url
         self.host = host or settings.falkordb_host
         self.port = port or settings.falkordb_port
         self.password = password if password is not None else settings.falkordb_password
+        self.username = username or settings.falkordb_username
+        self.ssl = ssl if ssl is not None else settings.falkordb_ssl
+        self.ssl_cert_reqs = ssl_cert_reqs or settings.falkordb_ssl_cert_reqs
         self._client: Optional[FalkorDB] = None
         self._initialized_graphs = set()
 
     def get_client(self) -> FalkorDB:
         """Returns the active FalkorDB client or creates a new connection."""
         if self._client is None:
-            logger.info(f"Connecting to FalkorDB at {self.host}:{self.port}...")
-            self._client = FalkorDB(
-                host=self.host,
-                port=self.port,
-                password=self.password if self.password else None,
-            )
+            if self.url:
+                logger.info("Connecting to FalkorDB Cloud via URL...")
+                url_kwargs: Dict[str, Any] = {}
+                if "falkors://" in self.url or "rediss://" in self.url:
+                    url_kwargs["ssl_cert_reqs"] = self.ssl_cert_reqs
+                self._client = FalkorDB.from_url(self.url, **url_kwargs)
+            else:
+                logger.info(f"Connecting to FalkorDB at {self.host}:{self.port} (SSL={self.ssl})...")
+                kwargs: Dict[str, Any] = {
+                    "host": self.host,
+                    "port": self.port,
+                }
+                if self.password:
+                    kwargs["password"] = self.password
+                if self.username:
+                    kwargs["username"] = self.username
+                if self.ssl:
+                    kwargs["ssl"] = True
+                    if self.ssl_cert_reqs:
+                        kwargs["ssl_cert_reqs"] = self.ssl_cert_reqs
+
+                self._client = FalkorDB(**kwargs)
         return self._client
 
     def ping(self) -> bool:

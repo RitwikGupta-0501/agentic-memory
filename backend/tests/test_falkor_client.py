@@ -19,3 +19,30 @@ def test_tenant_graph_key_generation():
     nebula_key = router.get_graph_key("nebula-cloud", shared=True)
     assert nebula_key == "mem_nebula_cloud_shared"
     assert nebula_key != shared_key
+
+
+def test_falkordb_cloud_url_connection_routing():
+    """TEST-CLOUD-01: Verifies TenantGraphRouter correctly parses and connects via FalkorDB Cloud URL."""
+    # Test connection via URL scheme (falkor://)
+    cloud_router = TenantGraphRouter(url="falkor://localhost:6379")
+    assert cloud_router.url == "falkor://localhost:6379"
+    assert cloud_router.ping() is True
+
+
+def test_falkordb_cloud_tls_parameters_configuration():
+    """TEST-CLOUD-02: Verifies TenantGraphRouter properly preserves Cloud SSL, username, and auth configuration."""
+    router = TenantGraphRouter(
+        host="test-cluster.cloud.falkordb.com",
+        port=16379,
+        username="default",
+        password="secret_token",
+        ssl=True,
+        ssl_cert_reqs="none",
+    )
+    assert router.host == "test-cluster.cloud.falkordb.com"
+    assert router.port == 16379
+    assert router.username == "default"
+    assert router.password == "secret_token"
+    assert router.ssl is True
+    assert router.ssl_cert_reqs == "none"
+
