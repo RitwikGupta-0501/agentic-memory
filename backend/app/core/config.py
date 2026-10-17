@@ -1,6 +1,6 @@
 """Application configuration settings."""
 
-from typing import List, Union
+from typing import List, Optional, Union
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -13,10 +13,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # FalkorDB Connection
+    # FalkorDB Connection (Local or FalkorDB Cloud)
+    falkordb_url: Optional[str] = None  # e.g., "falkors://default:password@cloud.falkordb.com:6379"
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
     falkordb_password: str = ""
+    falkordb_username: Optional[str] = None
+    falkordb_ssl: bool = False
+    falkordb_ssl_cert_reqs: str = "required"  # "required" or "none" for cloud certificates
 
     # Backend Server
     backend_host: str = "0.0.0.0"
