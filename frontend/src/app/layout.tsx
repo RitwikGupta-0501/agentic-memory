@@ -4,6 +4,12 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "AegisGraph: 4-Tier Cognitive Graph Memory",
   description: "Autonomous Agent Memory & Coordination Engine powered by FalkorDB",
+  icons: {
+    icon: [
+      { url: "/favicon.ico", sizes: "any" },
+      { url: "/icon.svg", type: "image/svg+xml" },
+    ],
+  },
 };
 
 export default function RootLayout({
