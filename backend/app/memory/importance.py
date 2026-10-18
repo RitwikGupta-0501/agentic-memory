@@ -51,9 +51,10 @@ class ImportanceScorer:
                 if provider == "gemini" and settings.gemini_api_key:
                     from langchain_google_genai import ChatGoogleGenerativeAI
                     self._llm = ChatGoogleGenerativeAI(
-                        model="gemini-1.5-flash",
+                        model="gemini-flash-lite-latest",
                         google_api_key=settings.gemini_api_key,
                         temperature=0.0,
+                        timeout=15.0,
                     )
                 elif provider == "openai" and settings.openai_api_key:
                     from langchain_openai import ChatOpenAI

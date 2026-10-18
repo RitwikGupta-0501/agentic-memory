@@ -1012,9 +1012,10 @@ class SemanticMemoryManager:
         elif provider == "gemini" and settings.gemini_api_key:
             from langchain_google_genai import ChatGoogleGenerativeAI
             llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
+                model="gemini-flash-lite-latest",
                 temperature=0.0,
                 google_api_key=settings.gemini_api_key,
+                timeout=15.0,
             )
             return llm.with_structured_output(FactExtractionResult)
         elif provider == "anthropic" and settings.anthropic_api_key:
