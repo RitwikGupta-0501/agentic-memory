@@ -491,6 +491,8 @@ class SemanticMemoryManager:
             "confidence": float(confidence),
             "cardinality": card_str,
             "now": now,
+            "user_id": user_id,
+            "scope": "tenant",
         }
 
         res = self.router.query(
@@ -814,6 +816,7 @@ class SemanticMemoryManager:
         as_of: float,
         user_id: Optional[str] = None,
         top_k: int = 5,
+        isolation_mode: str = "tenant_shared",
     ) -> List[HippoRAGGroundedEpisode]:
         """Projects entity activation mass onto episodic memory with temporal and invalidation gating."""
         if not norm_pi:
@@ -828,6 +831,8 @@ class SemanticMemoryManager:
             {
                 "entity_names": active_entities,
                 "as_of": as_of,
+                "isolation_mode": isolation_mode,
+                "user_id": user_id,
             },
             tenant_id=tenant_id,
             user_id=user_id,
@@ -888,6 +893,7 @@ class SemanticMemoryManager:
         max_hops: int = 2,
         as_of: Optional[float] = None,
         user_id: Optional[str] = None,
+        isolation_mode: str = "tenant_shared",
     ) -> HippoRAGResult:
         """Executes NeurIPS 2024 HippoRAG associative retrieval over active knowledge graph."""
         target_t = float(as_of) if as_of is not None else time.time()
@@ -920,6 +926,8 @@ class SemanticMemoryManager:
                 "seed_names": seeds,
                 "as_of": target_t,
                 "max_hops": max(1, min(3, max_hops)),
+                "isolation_mode": isolation_mode,
+                "user_id": user_id,
             },
             tenant_id=tenant_id,
             user_id=user_id,
@@ -985,6 +993,7 @@ class SemanticMemoryManager:
             as_of=target_t,
             user_id=user_id,
             top_k=top_k,
+            isolation_mode=isolation_mode,
         )
 
         # Step 6: Return structured result

@@ -53,6 +53,8 @@ CREATE (new_ep:Episode {
     id: $episode_id,
     session_id: $session_id,
     tenant_id: $tenant_id,
+    user_id: $user_id,
+    scope: coalesce($scope, 'private'),
     role: $role,
     actor_id: $actor_id,
     content: $content,
@@ -201,7 +203,24 @@ EPISODE_VECTOR_SEARCH_CANDIDATES = """
 CALL db.idx.vector.queryNodes('Episode', 'embedding', $candidate_limit, vecf32($query_vec))
 YIELD node AS ep, score AS distance
 WITH ep, (1.0 - distance) AS similarity_score
-WHERE (ep.session_id = $session_id OR $cross_session = true)
+WHERE coalesce(ep.archived, false) = false
+  AND ($cross_session = true OR ep.session_id = $session_id)
+  AND (ep.embedding_model = $current_model OR $current_model IS NULL)
+  AND similarity_score >= coalesce(ep.vcache_threshold, 0.50)
+RETURN ep, similarity_score
+ORDER BY similarity_score DESC
+"""
+
+EPISODE_ISOLATED_VECTOR_SEARCH_CANDIDATES = """
+CALL db.idx.vector.queryNodes('Episode', 'embedding', $candidate_limit, vecf32($query_vec))
+YIELD node AS ep, score AS distance
+WITH ep, (1.0 - distance) AS similarity_score
+WHERE coalesce(ep.archived, false) = false
+  AND (
+    $isolation_mode = 'team_open'
+    OR ($user_id IS NULL OR ep.user_id = $user_id OR ep.user_id IS NULL)
+  )
+  AND ($cross_session = true OR ep.session_id = $session_id)
   AND (ep.embedding_model = $current_model OR $current_model IS NULL)
   AND similarity_score >= coalesce(ep.vcache_threshold, 0.50)
 RETURN ep, similarity_score
@@ -217,6 +236,10 @@ WITH ep, CASE
     ELSE (1.0 - distance) 
 END AS raw_score
 WHERE coalesce(ep.archived, false) = false
+  AND (
+    $isolation_mode = 'team_open'
+    OR ($user_id IS NULL OR ep.user_id = $user_id OR ep.user_id IS NULL)
+  )
   AND ($cross_session = true OR ep.session_id = $session_id)
 RETURN ep, raw_score
 """
@@ -224,6 +247,10 @@ RETURN ep, raw_score
 EPISODE_FALLBACK_SCAN_FETCH = """
 MATCH (ep:Episode)
 WHERE coalesce(ep.archived, false) = false
+  AND (
+    $isolation_mode = 'team_open'
+    OR ($user_id IS NULL OR ep.user_id = $user_id OR ep.user_id IS NULL)
+  )
   AND ($cross_session = true OR ep.session_id = $session_id)
 RETURN ep, 0.5 AS raw_score
 ORDER BY ep.timestamp DESC
@@ -325,6 +352,8 @@ ON CREATE SET
     s.canonical_name = $subject_canonical,
     s.type = $subject_type,
     s.aliases = [$subject],
+    s.user_id = $user_id,
+    s.scope = coalesce($scope, 'tenant'),
     s.created_at = $now,
     s.updated_at = $now,
     s.embedding = CASE WHEN $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE NULL END
@@ -332,6 +361,8 @@ ON MATCH SET
     s.id = coalesce(s.id, $subject_id),
     s.canonical_name = coalesce(s.canonical_name, $subject_canonical),
     s.type = coalesce(s.type, $subject_type),
+    s.user_id = coalesce(s.user_id, $user_id),
+    s.scope = coalesce(s.scope, 'tenant'),
     s.embedding = CASE WHEN s.embedding IS NULL AND $subject_vec IS NOT NULL THEN vecf32($subject_vec) ELSE s.embedding END,
     s.aliases = CASE WHEN $subject IN coalesce(s.aliases, []) THEN coalesce(s.aliases, []) ELSE coalesce(s.aliases, []) + $subject END,
     s.updated_at = $now
@@ -343,6 +374,8 @@ ON CREATE SET
     o.canonical_name = $object_canonical,
     o.type = $object_type,
     o.aliases = [$object],
+    o.user_id = $user_id,
+    o.scope = coalesce($scope, 'tenant'),
     o.created_at = $now,
     o.updated_at = $now,
     o.embedding = CASE WHEN $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE NULL END
@@ -350,6 +383,8 @@ ON MATCH SET
     o.id = coalesce(o.id, $object_id),
     o.canonical_name = coalesce(o.canonical_name, $object_canonical),
     o.type = coalesce(o.type, $object_type),
+    o.user_id = coalesce(o.user_id, $user_id),
+    o.scope = coalesce(o.scope, 'tenant'),
     o.embedding = CASE WHEN o.embedding IS NULL AND $object_vec IS NOT NULL THEN vecf32($object_vec) ELSE o.embedding END,
     o.aliases = CASE WHEN $object IN coalesce(o.aliases, []) THEN coalesce(o.aliases, []) ELSE coalesce(o.aliases, []) + $object END,
     o.updated_at = $now
@@ -367,7 +402,9 @@ CREATE (s)-[new_r:RELATES_TO {
     valid_from: coalesce(preserved_valid_from, $now),
     valid_to: NULL,
     transaction_from: $now,
-    source_episode: $episode_id
+    source_episode: $episode_id,
+    user_id: $user_id,
+    scope: coalesce($scope, 'tenant')
 }]->(o)
 
 // 5. Establish full bidirectional cross-layer provenance to Episode
@@ -564,14 +601,25 @@ HIPPORAG_ACTIVE_SUBGRAPH_EXPANSION = """
 MATCH (seed:Entity)
 WHERE (seed.name IN $seed_names OR seed.canonical_name IN $seed_names)
   AND coalesce(seed.created_at, 0.0) <= $as_of
+  AND (
+    $isolation_mode <> 'user_strict'
+    OR $user_id IS NULL
+    OR seed.user_id = $user_id
+    OR seed.user_id IS NULL
+  )
 MATCH path = (seed)-[r:RELATES_TO*1..3]-(target:Entity)
 WHERE length(path) <= $max_hops
   AND none(n IN nodes(path)[1..] WHERE n = seed)
   AND none(idx IN range(0, length(path) - 2) WHERE nodes(path)[idx] = nodes(path)[idx + 2])
-  AND all(node IN nodes(path) WHERE coalesce(node.created_at, 0.0) <= $as_of)
+  AND all(node IN nodes(path) WHERE coalesce(node.created_at, 0.0) <= $as_of AND (
+      $isolation_mode <> 'user_strict' OR $user_id IS NULL OR node.user_id = $user_id OR node.user_id IS NULL
+  ))
   AND all(edge IN relationships(path) WHERE 
       edge.valid_from <= $as_of 
       AND (edge.valid_to IS NULL OR edge.valid_to > $as_of)
+      AND (
+          $isolation_mode <> 'user_strict' OR $user_id IS NULL OR edge.user_id = $user_id OR edge.user_id IS NULL
+      )
   )
 UNWIND relationships(path) AS edge
 RETURN DISTINCT startNode(edge).name AS source,
@@ -588,6 +636,12 @@ WHERE e.name IN $entity_names
 MATCH (e)-[r:DERIVED_FROM|MENTIONED_IN]->(ep:Episode)
 WHERE coalesce(ep.archived, false) = false
   AND coalesce(ep.timestamp, r.timestamp, 0.0) <= $as_of
+  AND (
+    $isolation_mode = 'team_open'
+    OR $user_id IS NULL
+    OR ep.user_id = $user_id
+    OR ep.user_id IS NULL
+  )
 OPTIONAL MATCH (s:Entity)-[old_rel:RELATES_TO {source_episode: ep.id}]->(t:Entity)
 WHERE (s = e OR t = e) AND old_rel.valid_to IS NOT NULL AND old_rel.valid_to <= $as_of
 OPTIONAL MATCH (s2:Entity)-[act_rel:RELATES_TO {source_episode: ep.id}]->(t2:Entity)
@@ -902,6 +956,7 @@ CYPHER_CATALOG: Dict[str, str] = {
     "VISUALIZE_ALL_GRAPH": VISUALIZE_ALL_GRAPH,
     "VISUALIZE_ACTIVE_GRAPH": VISUALIZE_ACTIVE_GRAPH,
     "EPISODE_VECTOR_SEARCH_CANDIDATES": EPISODE_VECTOR_SEARCH_CANDIDATES,
+    "EPISODE_ISOLATED_VECTOR_SEARCH_CANDIDATES": EPISODE_ISOLATED_VECTOR_SEARCH_CANDIDATES,
     "GRAPH_METADATA_GET": GRAPH_METADATA_GET,
     "GRAPH_METADATA_UPSERT": GRAPH_METADATA_UPSERT,
     "SESSION_ENSURE_AND_LINK": SESSION_ENSURE_AND_LINK,

@@ -82,6 +82,8 @@ class CognitiveAgentEngine:
         session_id: str,
         user_prompt: str,
         user_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+        isolation_mode: str = "tenant_shared",
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Runs the cognitive agent, streaming thoughts, memory retrievals, blackboard updates, and answer."""
         task_id = f"task_{uuid.uuid4().hex[:6]}"
@@ -98,14 +100,17 @@ class CognitiveAgentEngine:
             content=user_prompt,
             role="user",
             user_id=user,
+            parent_session_id=parent_session_id,
+            scope="private",
         )
 
         yield {
             "type": "agent_event",
             "agent": "Orchestrator Agent",
             "phase": "plan",
-            "message": f"Received goal: '{user_prompt}'. Logged turn to Episodic Memory ({ep['id']}). Decomposing into Working Memory DAG...",
+            "message": f"Received goal: '{user_prompt}' [Policy: {isolation_mode}]. Logged turn to Episodic Memory ({ep['id']}). Decomposing into Working Memory DAG...",
             "cypher": "MERGE (new_ep:Episode {...})",
+            "isolation_mode": isolation_mode,
         }
 
         # -------------------------------------------------------------
@@ -179,6 +184,7 @@ class CognitiveAgentEngine:
             cross_session=True,
             top_k=3,
             user_id=user,
+            isolation_mode=isolation_mode,
         )
 
         recalled_count = len(historical_episodes)
@@ -188,8 +194,9 @@ class CognitiveAgentEngine:
             "type": "episodic_retrieval_event",
             "agent": "Context & Triage Agent",
             "phase": "retrieval",
-            "message": f"Park et al. 3-factor retrieval matched {recalled_count} historical episode(s) (top composite: {top_score}).",
+            "message": f"Park et al. 3-factor retrieval matched {recalled_count} historical episode(s) (top composite: {top_score}) under policy '{isolation_mode}'.",
             "cypher": "CALL db.idx.vector.queryNodes('Episode'...) + MemoryBank decay + MemRL utility",
+            "isolation_mode": isolation_mode,
             "retrieved_episodes": [
                 {
                     "id": h["episode"]["id"],
@@ -229,6 +236,7 @@ class CognitiveAgentEngine:
             seed_entities=unique_seeds,
             top_k=3,
             user_id=user,
+            isolation_mode=isolation_mode,
         )
 
         yield {
@@ -481,6 +489,8 @@ class CognitiveAgentEngine:
             "You are AegisGraph Cognitive Assistant, an AI agent with persistent multi-tenant memory "
             "backed by FalkorDB (Episodic, Semantic, Working, and Procedural Memory).\n"
             "Answer the user query accurately and concisely using the retrieved memory context.\n\n"
+            f"ACTIVE MEMORY ISOLATION POLICY: {isolation_mode}\n"
+            f"CURRENT USER CONTEXT: {user}\n\n"
             f"RECALLED EPISODIC INTERACTIONS:\n{ep_context_text}\n\n"
             f"RECALLED SEMANTIC ENTITIES:\n{hippo_entities_text}\n\n"
             f"ACTIVE KNOWLEDGE GRAPH RELATIONS:\n{active_edges_text}\n\n"
@@ -507,6 +517,7 @@ class CognitiveAgentEngine:
                 "status": "ERROR",
                 "message": err_msg,
                 "agent": "Response Agent",
+                "isolation_mode": isolation_mode,
             }
             return
 
@@ -533,6 +544,7 @@ class CognitiveAgentEngine:
                 "status": "ERROR",
                 "message": err_msg,
                 "agent": "Response Agent",
+                "isolation_mode": isolation_mode,
             }
             return
 
@@ -543,6 +555,7 @@ class CognitiveAgentEngine:
             content=answer_text,
             role="agent",
             user_id=user,
+            scope="private",
         )
 
         working_memory.complete_subtask(
@@ -559,6 +572,7 @@ class CognitiveAgentEngine:
             "agent": "Cognitive Agent",
             "answer": answer_text,
             "episode_id": agent_ep["id"],
+            "isolation_mode": isolation_mode,
         }
 
         yield {
@@ -569,6 +583,7 @@ class CognitiveAgentEngine:
             "result": action_result,
             "answer": answer_text,
             "task_id": task_id,
+            "isolation_mode": isolation_mode,
         }
 
 

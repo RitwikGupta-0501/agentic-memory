@@ -12,14 +12,28 @@ Built for **Graph Hacks: Context for AI Agents (Powered by FalkorDB)**
 
 Standard LLM agents suffer from context amnesia, race conditions during multi-agent handoffs, and an inability to learn from operational failures across sessions. Vector-only RAG memory fails because it treats memory as flat, timeless text chunks rather than evolving, causal relationships.
 
-**AegisGraph** is a two-part cognitive platform built on **FalkorDB**:
+**AegisGraph** is a production-grade cognitive graph memory platform built on **FalkorDB**:
 
-1. **The Core Memory Engine:** A 4-tier cognitive graph architecture implementing **Working, Episodic, Semantic, and Procedural memory** with hardware-level multi-tenant graph isolation, bi-temporal conflict resolution, and atomic multi-agent blackboard coordination.
-2. **The Showcase Control Plane:** An interactive multi-tenant web platform where users can switch tenants and users, watch multiple agents coordinate over shared graph state in real time, inspect live OpenCypher mutations, and verify cross-session procedural learning.
+1. **4-Tier Cognitive Graph Architecture:** Implements **Working, Episodic, Semantic, and Procedural memory** with hardware-level multi-tenant graph isolation, bi-temporal conflict resolution, and atomic multi-agent blackboard coordination.
+2. **Autonomous Cognitive Agent:** Answers arbitrary user queries grounded in dual-path memory retrieval (Park et al. 3-factor episodic recall and HippoRAG Personalized PageRank associative graph walks) with autonomous Reflexion error-to-guardrail learning and streaming Server-Sent Events (SSE).
 
 ---
 
-## 2. Theoretical Foundation & Research Citations
+## 2. Documentation Suite
+
+Comprehensive guides, schemas, and runnable code examples are available in the [`docs/`](docs/README.md) directory:
+
+| Guide | Description |
+| :--- | :--- |
+| **[The 4 Memory Tiers](docs/memory-tiers.md)** | Deep dive into Episodic, Semantic, Working, and Procedural memory graph schemas in FalkorDB. |
+| **[Ingestion & Extraction](docs/extraction.md)** | OpenIE structured fact extraction, bi-temporal validity (`valid_at`/`invalid_at`), and Reflexion loops. |
+| **[Dual-Path Retrieval](docs/retrieval.md)** | Algorithmic breakdown of Park et al. 3-factor composite recall, Ebbinghaus decay, and HippoRAG PPR graph walks. |
+| **[Agent Integration Guide](docs/agent-integration.md)** | Runnable integration examples in Python, REST API, Server-Sent Events (SSE), and LangChain tools. |
+| **[API Reference](docs/api-reference.md)** | Complete specification of all FastAPI endpoints, request/response JSON schemas, and event types. |
+
+---
+
+## 3. Theoretical Foundation & Research Citations
 
 Every architectural mechanism in AegisGraph directly implements principles from peer-reviewed cognitive agent memory research:
 
@@ -39,7 +53,7 @@ Every architectural mechanism in AegisGraph directly implements principles from 
 
 ---
 
-## 3. Architecture & Data Model
+## 4. Architecture & Data Model
 
 ```mermaid
 flowchart TD
@@ -83,11 +97,11 @@ flowchart TD
 
 ---
 
-## 4. Key OpenCypher Algorithms
+## 5. Key OpenCypher Algorithms
 
 All agent actions execute explicit, parameterized OpenCypher queries against FalkorDB:
 
-### 4.1 Bi-Temporal Invalidation & Upsert
+### 5.1 Bi-Temporal Invalidation & Upsert
 ```cypher
 MATCH (s:Entity {name: $subject})-[old_r:RELATES_TO {predicate: $predicate}]->(old_o:Entity)
 WHERE old_r.valid_to IS NULL AND old_o.name <> $new_object
@@ -107,7 +121,7 @@ CREATE (new_o)-[:DERIVED_FROM]->(ep)
 RETURN invalidated_count, new_r
 ```
 
-### 4.2 Atomic Multi-Agent SubTask Claim
+### 5.2 Atomic Multi-Agent SubTask Claim
 ```cypher
 MATCH (t:TaskRun {id: $task_id})-[:HAS_SUBTASK]->(st:SubTask {status: 'PENDING'})
 WHERE NOT (st)-[:DEPENDS_ON]->(:SubTask {status: 'PENDING'})
@@ -122,7 +136,7 @@ OPTIONAL MATCH (st)-[:DEPENDS_ON]->(parent:SubTask)-[:PINNED_CONTEXT]->(ctx)
 RETURN st, collect(ctx) AS inherited_context_nodes
 ```
 
-### 4.3 Dynamic Score Adaptation & Feedback Loop (vCache + MemRL)
+### 5.3 Dynamic Score Adaptation & Feedback Loop (vCache + MemRL)
 ```cypher
 MATCH (st:SubTask {id: $subtask_id})-[:PINNED_CONTEXT]->(m)
 SET m.access_count = coalesce(m.access_count, 0) + 1,
@@ -137,7 +151,7 @@ RETURN m.id AS id, m.utility_score AS new_utility, m.vcache_threshold AS new_thr
 
 ---
 
-## 5. Quickstart Guide
+## 6. Quickstart Guide
 
 ### Option 1: One-Click Docker Compose
 ```bash
@@ -167,6 +181,6 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ---
 
-## 6. AI Coding Assistant Disclosure
+## 7. AI Coding Assistant Disclosure
 
 In compliance with **Hackathon Rule #11**, this repository leveraged AI pair programming tools (including Google DeepMind Antigravity) for architectural design ideation, boilerplate generation, and verification test scripting. All OpenCypher graph modeling, bi-temporal graph query designs, multi-tenant partitioning, and blackboard concurrency mechanisms were engineered and validated directly against FalkorDB.

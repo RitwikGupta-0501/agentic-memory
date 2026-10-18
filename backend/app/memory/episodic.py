@@ -15,6 +15,7 @@ from app.core.cypher_catalog import (
     EPISODE_HYBRID_CANDIDATE_FETCH,
     EPISODE_UTILITY_FEEDBACK_UPDATE,
     EPISODE_VECTOR_SEARCH_CANDIDATES,
+    EPISODE_ISOLATED_VECTOR_SEARCH_CANDIDATES,
     MULTI_SESSION_LINEAGE_QUERY,
     SESSION_ENSURE_AND_LINK,
 )
@@ -93,6 +94,7 @@ class EpisodicMemoryManager:
         parent_session_id: Optional[str] = None,
         episode_id: Optional[str] = None,
         timestamp: Optional[float] = None,
+        scope: Optional[str] = "private",
     ) -> Dict[str, Any]:
         """Atomically appends an episode to the session tail pointer and maintains linear timeline."""
         now = float(timestamp) if timestamp is not None else time.time()
@@ -159,6 +161,7 @@ class EpisodicMemoryManager:
             "parent_session_id": parent_session_id,
             "tenant_id": record.tenant_id,
             "user_id": user_id,
+            "scope": scope or "private",
             "timestamp": record.timestamp,
             "episode_id": record.id,
             "role": record.role,
@@ -201,23 +204,35 @@ class EpisodicMemoryManager:
         session_id: str,
         limit: int = 50,
         user_id: Optional[str] = None,
+        isolation_mode: str = "tenant_shared",
     ) -> List[Dict[str, Any]]:
         """Retrieves episodes in chronological order for a given session."""
         query = """
         MATCH (ep:Episode {session_id: $session_id})
+        WHERE coalesce(ep.archived, false) = false
+          AND (
+            $isolation_mode = 'team_open'
+            OR ($user_id IS NULL OR ep.user_id = $user_id OR ep.user_id IS NULL)
+          )
         RETURN ep.id AS id, ep.role AS role, ep.actor_id AS actor_id,
                ep.status AS status, ep.content AS content,
                ep.structured_payload AS structured_payload,
                ep.importance_score AS importance_score,
                ep.utility_score AS utility_score,
                ep.access_count AS access_count,
-               ep.timestamp AS timestamp, ep.token_count AS token_count
+               ep.timestamp AS timestamp, ep.token_count AS token_count,
+               ep.user_id AS user_id, ep.scope AS scope
         ORDER BY ep.timestamp ASC
         LIMIT $limit
         """
         res = self.router.query(
             query,
-            {"session_id": session_id, "limit": limit},
+            {
+                "session_id": session_id,
+                "limit": limit,
+                "isolation_mode": isolation_mode,
+                "user_id": user_id,
+            },
             tenant_id=tenant_id,
             user_id=user_id,
         )
@@ -244,6 +259,8 @@ class EpisodicMemoryManager:
                     "access_count": row[8] or 0,
                     "timestamp": row[9],
                     "token_count": row[10] or 0,
+                    "user_id": row[11] if len(row) > 11 else None,
+                    "scope": row[12] if len(row) > 12 else "private",
                 })
         return episodes
 
@@ -256,6 +273,7 @@ class EpisodicMemoryManager:
         cross_session: bool = False,
         min_similarity: Optional[float] = None,
         user_id: Optional[str] = None,
+        isolation_mode: str = "tenant_shared",
     ) -> List[Dict[str, Any]]:
         """Searches vector index for top candidate episodes filtered by vCache threshold and active model."""
         vec = self.embeddings.embed_text(query)
@@ -268,10 +286,12 @@ class EpisodicMemoryManager:
             "session_id": session_id or "",
             "cross_session": cross_session or (session_id is None),
             "current_model": active_model,
+            "isolation_mode": isolation_mode,
+            "user_id": user_id,
         }
 
         res = self.router.query(
-            EPISODE_VECTOR_SEARCH_CANDIDATES,
+            EPISODE_ISOLATED_VECTOR_SEARCH_CANDIDATES,
             params,
             tenant_id=t_id,
             user_id=user_id,
@@ -304,6 +324,8 @@ class EpisodicMemoryManager:
                     "access_count": props.get("access_count", 0),
                     "timestamp": props.get("timestamp"),
                     "similarity_score": round(similarity, 4),
+                    "user_id": props.get("user_id"),
+                    "scope": props.get("scope", "private"),
                 })
 
         if min_similarity is not None:
@@ -326,6 +348,7 @@ class EpisodicMemoryManager:
         strict_vcache: bool = False,
         touch_recall: bool = True,
         user_id: Optional[str] = None,
+        isolation_mode: str = "tenant_shared",
     ) -> List[Dict[str, Any]]:
         """Retrieves and ranks episodic memories using Park et al. 3-factor composite ranking.
 
@@ -345,6 +368,8 @@ class EpisodicMemoryManager:
             "candidate_limit": candidate_limit,
             "session_id": session_id or "",
             "cross_session": cross_session or (session_id is None),
+            "isolation_mode": isolation_mode,
+            "user_id": user_id,
         }
 
         candidate_rows = []
@@ -368,6 +393,8 @@ class EpisodicMemoryManager:
                     "candidate_limit": candidate_limit,
                     "session_id": session_id or "",
                     "cross_session": cross_session or (session_id is None),
+                    "isolation_mode": isolation_mode,
+                    "user_id": user_id,
                 },
                 tenant_id=t_id,
                 user_id=user_id,

@@ -17,6 +17,11 @@ class AgentRunRequest(BaseModel):
     tenant_id: Optional[str] = None
     user_id: Optional[str] = None
     session_id: Optional[str] = Field(default=None, description="Session ID. If not provided, a new session is generated.")
+    parent_session_id: Optional[str] = Field(default=None, description="Optional parent session ID to link conversation lineage.")
+    isolation_mode: Optional[str] = Field(
+        default="tenant_shared",
+        description="Memory isolation policy: 'tenant_shared', 'user_strict', or 'team_open'",
+    )
     prompt: str = Field(..., min_length=1)
 
 
@@ -26,6 +31,7 @@ async def run_multi_agent_stream(req: AgentRunRequest):
     tenant_id = req.tenant_id or settings.default_tenant_id
     user_id = req.user_id or settings.default_user_id
     session_id = req.session_id or f"session_{uuid.uuid4().hex[:8]}"
+    isolation_mode = req.isolation_mode or "tenant_shared"
 
     async def event_generator():
         async for event in multi_agent_engine.execute_task_stream(
@@ -33,6 +39,8 @@ async def run_multi_agent_stream(req: AgentRunRequest):
             session_id=session_id,
             user_prompt=req.prompt,
             user_id=user_id,
+            parent_session_id=req.parent_session_id,
+            isolation_mode=isolation_mode,
         ):
             yield {"event": "agent_step", "data": json.dumps(event)}
 
@@ -45,6 +53,7 @@ async def run_multi_agent_sync(req: AgentRunRequest) -> Dict[str, Any]:
     tenant_id = req.tenant_id or settings.default_tenant_id
     user_id = req.user_id or settings.default_user_id
     session_id = req.session_id or f"session_{uuid.uuid4().hex[:8]}"
+    isolation_mode = req.isolation_mode or "tenant_shared"
 
     events = []
     error_event = None
@@ -55,6 +64,8 @@ async def run_multi_agent_sync(req: AgentRunRequest) -> Dict[str, Any]:
         session_id=session_id,
         user_prompt=req.prompt,
         user_id=user_id,
+        parent_session_id=req.parent_session_id,
+        isolation_mode=isolation_mode,
     ):
         events.append(event)
         if event.get("type") == "error":

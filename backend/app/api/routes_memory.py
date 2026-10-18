@@ -105,12 +105,14 @@ class EpisodeRetrieveRequest(BaseModel):
     strict_vcache: bool = False
     touch_recall: bool = True
     user_id: Optional[str] = None
+    isolation_mode: Optional[str] = "tenant_shared"
 
 
 @router.get("/graph")
 def get_graph_data(
     tenant_id: str = Query(default=settings.default_tenant_id),
     user_id: Optional[str] = Query(default=None),
+    isolation_mode: str = Query(default="tenant_shared"),
     include_invalidated: bool = Query(default=True),
 ) -> Dict[str, Any]:
     """Returns all nodes and edges formatted for Cytoscape.js rendering."""
@@ -139,26 +141,61 @@ def get_graph_data(
             rtype = row[5]
             target_id = str(row[6]) if row[6] is not None else None
 
+            # Skip internal bookkeeping metadata nodes from visualizer
+            if "GraphMetadata" in labels:
+                continue
+
+            props = getattr(node, "properties", {}) if node else {}
+            node_user = props.get("user_id")
+
+            # Memory Isolation filtering for Graph Visualizer:
+            if isolation_mode == "user_strict":
+                if user_id and node_user and node_user != user_id:
+                    continue
+            elif isolation_mode == "tenant_shared":
+                # In tenant_shared: Episodes and Sessions are private to the author.
+                # Semantic entities, Procedures, and Working memory are shared across the tenant.
+                if ("Episode" in labels or "Session" in labels) and user_id and node_user and node_user != user_id:
+                    continue
+
             # Determine Tier category for color coding
             tier = "unknown"
             node_label = "Node"
-            props = getattr(node, "properties", {}) if node else {}
+
+            # Compute scope badge
+            if "Episode" in labels or "Session" in labels:
+                scope = f"private:{node_user or 'user'}"
+            else:
+                scope = "shared"
 
             if "TaskRun" in labels or "SubTask" in labels:
                 tier = "working"  # Yellow
-                node_label = props.get("title", props.get("id", "Task"))
+                title = props.get("title") or props.get("goal") or props.get("id", "Task")
+                node_label = (title[:24] + "…") if len(title) > 24 else title
             elif "Episode" in labels or "Session" in labels:
                 tier = "episodic"  # Blue
                 if "Session" in labels:
-                    node_label = f"Session: {props.get('id', '')}"
+                    count = props.get("episode_count", 0)
+                    sid = str(props.get("id", ""))
+                    short_id = sid[-6:] if len(sid) >= 6 else sid
+                    node_label = f"Session: {short_id} ({count} turns)"
                 else:
-                    node_label = f"Ep: {props.get('id', '')}"
+                    role = str(props.get("role", "turn")).capitalize()
+                    content = str(props.get("content", "")).strip()
+                    if content:
+                        preview = (content[:22] + "…") if len(content) > 22 else content
+                        node_label = f"{role}: \"{preview}\""
+                    else:
+                        node_label = f"{role} Turn"
             elif "Entity" in labels:
                 tier = "semantic"  # Green
-                node_label = props.get("name", "Entity")
+                name = props.get("name") or props.get("canonical_name") or "Entity"
+                etype = props.get("type")
+                node_label = f"{name} ({etype})" if etype else name
             elif "Procedure" in labels or "ActionStep" in labels or "Guardrail" in labels:
                 tier = "procedural"  # Purple
-                node_label = props.get("name", props.get("rule_text", props.get("id", "Proc")))
+                name = props.get("name") or props.get("rule_text") or props.get("id", "Guardrail")
+                node_label = (name[:24] + "…") if len(name) > 24 else name
             elif "ConsolidatedInsight" in labels:
                 tier = "consolidated"
                 node_label = f"Insight: {props.get('id', '')}"
@@ -171,6 +208,8 @@ def get_graph_data(
                         "tier": tier,
                         "labels": labels,
                         "properties": props,
+                        "user_id": node_user,
+                        "scope": scope,
                     }
                 }
 
@@ -196,10 +235,17 @@ def get_graph_data(
                     }
                 })
 
+    # Only retain edges whose endpoints are both in nodes_map
+    valid_edges = [
+        e for e in edges_list
+        if e["data"]["source"] in nodes_map and e["data"]["target"] in nodes_map
+    ]
+
     return {
         "tenant_id": tenant_id,
+        "isolation_mode": isolation_mode,
         "nodes": list(nodes_map.values()),
-        "edges": edges_list,
+        "edges": valid_edges,
     }
 
 
@@ -299,12 +345,107 @@ def create_episode(req: EpisodeCreateRequest) -> Dict[str, Any]:
     return res
 
 
+@router.get("/sessions")
+def list_sessions(
+    tenant_id: str = Query(default=settings.default_tenant_id),
+    user_id: Optional[str] = Query(default=None),
+    isolation_mode: str = Query(default="tenant_shared"),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> List[Dict[str, Any]]:
+    """Lists available conversation sessions for a tenant/user ordered by activity."""
+    if isolation_mode == "team_open":
+        query = """
+        MATCH (s:Session)
+        RETURN s.id AS id,
+               s.created_at AS created_at,
+               s.updated_at AS updated_at,
+               s.episode_count AS episode_count,
+               s.user_id AS user_id,
+               s.tenant_id AS tenant_id
+        ORDER BY s.updated_at DESC
+        LIMIT $limit
+        """
+        params = {"limit": limit}
+    else:
+        query = """
+        MATCH (s:Session)
+        WHERE ($user_id IS NULL OR s.user_id = $user_id OR s.user_id IS NULL)
+        RETURN s.id AS id,
+               s.created_at AS created_at,
+               s.updated_at AS updated_at,
+               s.episode_count AS episode_count,
+               s.user_id AS user_id,
+               s.tenant_id AS tenant_id
+        ORDER BY s.updated_at DESC
+        LIMIT $limit
+        """
+        params = {"user_id": user_id, "limit": limit}
+
+    try:
+        res = falkor_router.query(
+            query,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            params=params,
+        )
+        sessions = []
+        if res and res.result_set:
+            for row in res.result_set:
+                sessions.append({
+                    "id": str(row[0]),
+                    "created_at": row[1],
+                    "updated_at": row[2],
+                    "episode_count": row[3] or 0,
+                    "user_id": row[4],
+                    "tenant_id": row[5],
+                })
+        return sessions
+    except Exception as e:
+        return []
+
+
+class SessionLinkRequest(BaseModel):
+    child_session_id: str
+    parent_session_id: str
+    tenant_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+@router.post("/sessions/link")
+def link_sessions(req: SessionLinkRequest) -> Dict[str, Any]:
+    """Explicitly links a child session to a parent session with [:PARENT_SESSION]."""
+    t_id = req.tenant_id or settings.default_tenant_id
+    query = """
+    MERGE (child:Session {id: $child_id})
+    MERGE (parent:Session {id: $parent_id})
+    MERGE (child)-[r:PARENT_SESSION]->(parent)
+    ON CREATE SET r.linked_at = timestamp() / 1000.0
+    RETURN child.id AS child_id, parent.id AS parent_id, type(r) AS rel_type
+    """
+    try:
+        res = falkor_router.query(
+            query,
+            tenant_id=t_id,
+            user_id=req.user_id,
+            params={"child_id": req.child_session_id, "parent_id": req.parent_session_id},
+        )
+        return {
+            "status": "SUCCESS",
+            "child_session_id": req.child_session_id,
+            "parent_session_id": req.parent_session_id,
+            "relationship": "PARENT_SESSION",
+        }
+    except Exception as e:
+        return {"status": "ERROR", "error": str(e)}
+
+
 @router.get("/episodes")
 def get_episodes(
     session_id: str = Query(..., description="Session identifier for chronological history"),
     tenant_id: str = Query(default=settings.default_tenant_id),
     limit: int = Query(default=50, ge=1, le=500),
     user_id: Optional[str] = Query(default=None),
+    isolation_mode: str = Query(default="tenant_shared"),
 ) -> List[Dict[str, Any]]:
     """Retrieves chronological episodes for a session."""
     return episodic_memory.get_session_history(
@@ -312,6 +453,7 @@ def get_episodes(
         session_id=session_id,
         limit=limit,
         user_id=user_id,
+        isolation_mode=isolation_mode,
     )
 
 
@@ -399,6 +541,7 @@ def retrieve_episodes_endpoint(req: EpisodeRetrieveRequest) -> Dict[str, Any]:
         strict_vcache=req.strict_vcache,
         touch_recall=req.touch_recall,
         user_id=req.user_id,
+        isolation_mode=req.isolation_mode or "tenant_shared",
     )
     return {
         "tenant_id": t_id,
