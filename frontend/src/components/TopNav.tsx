@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import Link from "next/link";
 import {
   Database,
   User,
@@ -9,6 +10,7 @@ import {
   ShieldCheck,
   CaretDown,
   LockKey,
+  BookOpen,
 } from "@phosphor-icons/react";
 import { HealthStatus, IsolationMode } from "@/lib/types";
 import { resetGuardrails } from "@/lib/api";
@@ -26,7 +28,7 @@ const USER_OPTIONS = [
 ];
 
 const ISOLATION_OPTIONS = [
-  { value: "tenant_shared", label: "Enterprise Shared (Model B)" },
+  { value: "tenant_shared", label: "Enterprise Shared" },
   { value: "user_strict", label: "Strict User Isolation" },
   { value: "team_open", label: "Open Team Collaboration" },
 ];
@@ -78,17 +80,21 @@ export function TopNav({
           <div className="flex items-center justify-center w-8 h-8 rounded-full bg-m3-primary/10 border border-m3-primary/20 text-m3-primary">
             <Database size={18} weight="bold" />
           </div>
-          <div className="flex flex-col">
-            <div className="flex items-center gap-2">
-              <span className="font-semibold text-sm tracking-tight text-white">AegisGraph</span>
-              <span className="px-2 py-0.5 text-[10px] font-medium tracking-wider uppercase rounded-full bg-m3-primary-container text-m3-on-primary-container">
-                4-Tier Memory
-              </span>
-            </div>
-            <span className="text-[11px] text-m3-on-surface-variant font-mono">
-              FalkorDB Cognitive Engine
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-sm tracking-tight text-white">AegisGraph</span>
+            <span className="px-2 py-0.5 text-[10px] font-medium tracking-wider uppercase rounded-full bg-m3-primary-container text-m3-on-primary-container">
+              4-Tier Memory
             </span>
           </div>
+
+          <Link
+            href="/docs"
+            title="Read system architecture and research foundations"
+            className="hidden sm:flex items-center gap-1.5 ml-2 px-3 py-1.5 rounded-full bg-white/5 hover:bg-white/10 text-m3-on-surface hover:text-white active:scale-[0.97] transition-all text-xs font-medium border border-white/10 cursor-pointer"
+          >
+            <BookOpen size={14} className="text-m3-primary" />
+            <span>Architecture & Research</span>
+          </Link>
         </div>
 
         {/* Global Controls & Status */}
