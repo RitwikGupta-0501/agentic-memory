@@ -148,14 +148,13 @@ cd agentic-memory
 # Copy environment variables
 cp .env.example .env
 
-# Start FalkorDB, FastAPI backend, and Next.js frontend
+# Start FalkorDB and FastAPI backend
 docker compose up --build
 ```
-- Showcase Platform: `http://localhost:3001`
 - FalkorDB Web Console: `http://localhost:3000`
 - FastAPI Interactive API Docs: `http://localhost:8000/docs`
 
-### Option 2: Local Development with `uv` and Node
+### Option 2: Local Development with `uv`
 ```bash
 # 1. Start FalkorDB
 docker compose up -d falkordb
@@ -164,11 +163,6 @@ docker compose up -d falkordb
 cd backend
 uv sync
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# 3. Run Frontend
-cd ../frontend
-npm install
-npm run dev
 ```
 
 ---

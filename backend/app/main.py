@@ -12,7 +12,6 @@ from app.core.falkor_client import falkor_router
 from app.api.routes_memory import router as memory_router
 from app.api.routes_coordination import router as coordination_router
 from app.api.routes_consolidation import router as consolidation_router
-from app.seed.seed_data import seed_all_tenants
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,21 +22,11 @@ logger = logging.getLogger("aegis.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: verifies FalkorDB and pre-seeds demo tenants on first startup."""
+    """Application lifespan: verifies FalkorDB connection on startup."""
     logger.info("Starting AegisGraph Cognitive Engine...")
     falkor_online = falkor_router.ping()
     if falkor_online:
         logger.info("Connected to FalkorDB successfully.")
-        try:
-            # Check if default tenant has data; if empty, pre-seed
-            test_query = "MATCH (n) RETURN count(n) AS count"
-            res = falkor_router.query(test_query, tenant_id=settings.default_tenant_id)
-            count = res.result_set[0][0] if res and res.result_set else 0
-            if count == 0:
-                logger.info("Default tenant graph is empty. Pre-seeding demo tenants in background thread...")
-                await asyncio.to_thread(seed_all_tenants)
-        except Exception as e:
-            logger.warning(f"Could not verify initial seed state: {e}")
     else:
         logger.warning(
             f"FalkorDB is currently offline at {settings.falkordb_host}:{settings.falkordb_port}. "
@@ -94,8 +83,3 @@ def health_check() -> Dict[str, Any]:
     }
 
 
-@app.post("/api/v1/seed")
-def trigger_seed() -> Dict[str, Any]:
-    """Manually re-seeds demo tenants (acme-payments, nebula-cloud)."""
-    seed_all_tenants()
-    return {"status": "SUCCESS", "message": "Demo tenants seeded successfully."}

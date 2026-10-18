@@ -76,13 +76,17 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
     def _get_client(self):
         if self._client is None:
             try:
-                from langchain_google_genai import GoogleGenAIEmbeddings
-                self._client = GoogleGenAIEmbeddings(
-                    model=self._model_name,
+                from langchain_google_genai import GoogleGenerativeAIEmbeddings
+                model = self._model_name
+                if "text-embedding-004" in model:
+                    model = "models/gemini-embedding-001"
+                self._client = GoogleGenerativeAIEmbeddings(
+                    model=model,
                     google_api_key=self._api_key,
+                    output_dimensionality=self._dimension,
                 )
             except Exception as e:
-                logger.error(f"Failed to initialize GoogleGenAIEmbeddings: {e}")
+                logger.error(f"Failed to initialize GoogleGenerativeAIEmbeddings: {e}")
                 raise
         return self._client
 
@@ -95,12 +99,24 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
         return self._model_name
 
     def embed_text(self, text: str) -> List[float]:
-        client = self._get_client()
-        return client.embed_query(text)
+        try:
+            client = self._get_client()
+            return client.embed_query(text)
+        except Exception as e:
+            if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                logger.warning(f"Gemini embedding quota exhausted (429), using deterministic fallback: {e}")
+                return DeterministicMockProvider(dimension=self._dimension).embed_text(text)
+            raise
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        client = self._get_client()
-        return client.embed_documents(texts)
+        try:
+            client = self._get_client()
+            return client.embed_documents(texts)
+        except Exception as e:
+            if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                logger.warning(f"Gemini embedding batch quota exhausted (429), using deterministic fallback: {e}")
+                return DeterministicMockProvider(dimension=self._dimension).embed_batch(texts)
+            raise
 
 
 class OpenAIEmbeddingProvider(BaseEmbeddingProvider):

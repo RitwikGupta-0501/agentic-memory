@@ -109,10 +109,7 @@ dmypy.json
 ehthumbs.db
 Thumbs.db
 
-# Frontend / Node
-frontend/node_modules/
-frontend/.next/
-frontend/out/
+# Node
 node_modules/
 .next/
 out/
